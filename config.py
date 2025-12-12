@@ -1,3 +1,4 @@
+# config.py
 
 # Local Ollama endpoint
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -14,4 +15,16 @@ DEBUG_AGENT_PROMPTS = True
 # Maximum number of ReAct reasoning steps per user turn
 MAX_REACT_STEPS = 5
 
+# Planner debug
 DEBUG_PLANNER = True
+
+# -------------------------
+# Stage 4: Dynamic replanning knobs
+# -------------------------
+
+# Maximum times the agent is allowed to replan in a single turn
+MAX_REPLANS = 2
+
+# Increase time budget because replanning can add extra LLM calls
+# (Optional but recommended)
+LLM_TIMEOUT_SECONDS = 300
