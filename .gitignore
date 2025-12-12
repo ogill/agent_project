@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+env/
+ENV/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Cursor IDE / VSCode
+.vscode/
+.cursor/
+.history/
+.project/
+
+# SDXL / ML cache
+models/
+weights/
+checkpoints/
+.cache/
+huggingface/
+hf_cache/
+
+# Generated creative output
+assets/output/*
+
+# Generated hero images (optional — keep or remove)
+assets/input/*_hero.png
+
+# Reports
+reports/*.json
+
+# Logs
+*.log
+
+# Jupyter (not used, but safe to include)
+.ipynb_checkpoints/
+
+# PyInstaller / build artifacts
+build/
+dist/
+*.spec
+
+# IDE folders
+.idea/
