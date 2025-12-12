@@ -1,31 +1,37 @@
 # tools.py
 
 import datetime
-from typing import Dict, Any
 import textwrap
+from typing import Any, Dict
 
 import requests
 
 from config import MODEL_NAME
 from llm_client import call_llm
 from schemas import (
+    AlwaysFailArgs,
+    FetchUrlArgs,
     GetTimeArgs,
     GetWeatherArgs,
-    FetchUrlArgs,
     SummarizeTextArgs,
 )
 
 
-# === Existing simple tools ===
+# ---------------------------------------------------------------------
+# Test tool for replanning
+# ---------------------------------------------------------------------
 
+def tool_always_fail(args: AlwaysFailArgs) -> str:
+    raise RuntimeError(f"Intentional failure triggered: {args.reason}")
+
+
+# ---------------------------------------------------------------------
+# Simple stub tools
+# ---------------------------------------------------------------------
 
 def tool_get_time(args: GetTimeArgs) -> str:
     """
-    Return the current time in a given city (stubbed; does not use real time zones).
-
-    Args:
-        args: GetTimeArgs Pydantic model with:
-            - city: str
+    Return the current time in a given city (stubbed; uses UTC, not real time zones).
     """
     city = args.city
     now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -35,29 +41,19 @@ def tool_get_time(args: GetTimeArgs) -> str:
 def tool_get_weather(args: GetWeatherArgs) -> str:
     """
     Return the current weather for a given city (stubbed).
-
-    Args:
-        args: GetWeatherArgs Pydantic model with:
-            - city: str
     """
     city = args.city
-    # This is deliberately stubbed; you can later integrate a real weather API.
     return f"The weather in {city} is SuNnY and 22°C (stubbed response)."
 
 
-# === Web + summarisation tools ===
-
+# ---------------------------------------------------------------------
+# Web + summarisation tools
+# ---------------------------------------------------------------------
 
 def tool_fetch_url(args: FetchUrlArgs) -> str:
     """
     Fetch the raw text/HTML from a URL.
-
-    Args:
-        args: FetchUrlArgs Pydantic model with:
-            - url: str
-
-    This uses requests.get with a short timeout and returns the first
-    few KB of content to avoid huge payloads.
+    Returns up to ~4k chars to avoid huge payloads.
     """
     url = args.url
     if not url:
@@ -69,7 +65,6 @@ def tool_fetch_url(args: FetchUrlArgs) -> str:
     except Exception as e:
         return f"Error fetching URL '{url}': {e!r}"
 
-    # Truncate to avoid overwhelming the LLM in subsequent steps
     content = resp.text
     max_chars = 4000
     if len(content) > max_chars:
@@ -80,15 +75,7 @@ def tool_fetch_url(args: FetchUrlArgs) -> str:
 
 def tool_summarize_text(args: SummarizeTextArgs) -> str:
     """
-    Summarise arbitrary text into a small number of bullet points,
-    highlighting any risks.
-
-    Args:
-        args: SummarizeTextArgs Pydantic model with:
-            - text: str
-            - bullets: int (default 3)
-
-    This tool uses the same LLM (MODEL_NAME) via call_llm.
+    Summarise text into N bullet points, highlighting risks.
     """
     text = args.text
     bullets = args.bullets
@@ -112,10 +99,16 @@ def tool_summarize_text(args: SummarizeTextArgs) -> str:
     return f"Summary ({bullets} bullet points, model={MODEL_NAME}):\n\n{summary}"
 
 
-# === Tool registry ===
-# Note: args_model holds the Pydantic schema; fn expects an instance of that model.
+# ---------------------------------------------------------------------
+# Tool registry
+# ---------------------------------------------------------------------
 
 TOOLS: Dict[str, Dict[str, Any]] = {
+    "always_fail": {
+        "fn": tool_always_fail,
+        "description": "Always fails intentionally to test dynamic replanning.",
+        "args_model": AlwaysFailArgs,
+    },
     "get_time": {
         "fn": tool_get_time,
         "args_model": GetTimeArgs,
