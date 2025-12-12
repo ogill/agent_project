@@ -2,6 +2,8 @@
 Prompt templates and system messages for agents.
 """
 
+
+
 PLANNER_SYSTEM_PROMPT = """
 You are a planning module for an Agentic AI system.
 
@@ -59,6 +61,7 @@ OUTPUT RULES (again):
 - Output MUST be JSON only.
 - Do NOT include Thought/Action/Observation.
 - Do NOT include any commentary or explanation outside the JSON.
+- Do NOT output any non-tool steps (tool=null) except the final compose_answer step.
 """
 
 
@@ -188,7 +191,61 @@ If a tool fails:
 - Continue reasoning using available Observations.
 """
 
+# ===== Planner prompts =====
 
-def get_react_system_prompt() -> str:
-    """Return the default system prompt for the ReAct-style agent."""
-    return REACT_SYSTEM_PROMPT
+PLANNER_SYSTEM_PROMPT_STRICT = PLANNER_SYSTEM_PROMPT
+
+PLANNER_SYSTEM_PROMPT_FAST = """
+You are a planning module.
+
+Return VALID JSON ONLY.
+No prose. No markdown. No code fences.
+
+Output MUST be a JSON OBJECT with exactly:
+{
+  "goal": "<string>",
+  "steps": [
+    {"id":"<string>","description":"<string>","tool": "<tool name or null>","args": <object or null>,"requires":[...]}
+  ]
+}
+
+Rules:
+- Each step MUST include: id, description, tool, args, requires
+- If tool is null, args MUST be null
+- Final step MUST be:
+  {"id":"compose_answer","description":"...","tool":null,"args":null,"requires":[...]}
+- Use minimal steps.
+- Do NOT add summarize_text steps.
+"""
+
+# ===== Executor prompts =====
+
+REACT_SYSTEM_PROMPT_STRICT = REACT_SYSTEM_PROMPT
+
+REACT_SYSTEM_PROMPT_FAST = """
+You are an agent executing a predefined plan.
+
+OUTPUT FORMAT (STRICT):
+Thought: ...
+Action: CALL_TOOL:<tool_name>({...}) OR NONE
+Final Answer: <short user-facing text>
+
+Rules:
+- If a tool is required, Action MUST call exactly that tool once.
+- If no tool is required, Action MUST be NONE.
+- No extra text outside the 3 fields.
+"""
+
+def get_planner_prompt(mode="strict"):
+    return (
+        PLANNER_SYSTEM_PROMPT_FAST
+        if mode == "fast"
+        else PLANNER_SYSTEM_PROMPT_STRICT
+    )
+
+def get_executor_prompt(mode="strict"):
+    return (
+        REACT_SYSTEM_PROMPT_FAST
+        if mode == "fast"
+        else REACT_SYSTEM_PROMPT_STRICT
+    )

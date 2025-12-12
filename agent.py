@@ -1,13 +1,16 @@
+# agent.py
+
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple, Set
 import json
 
-from config import DEBUG_AGENT, DEBUG_AGENT_PROMPTS, MAX_REACT_STEPS
+from config import DEBUG_AGENT, DEBUG_AGENT_PROMPTS, MAX_REACT_STEPS, PROMPT_MODE
 from llm_client import call_llm
 from tools import TOOLS
-from prompts import get_react_system_prompt
+from prompts import get_executor_prompt
 
-SYSTEM_PROMPT = get_react_system_prompt()
+
+SYSTEM_PROMPT = get_executor_prompt(PROMPT_MODE)
 
 
 def build_step_aware_prompt(
@@ -18,22 +21,26 @@ def build_step_aware_prompt(
     total_steps: int,
 ) -> str:
     """
-    Build a ReAct prompt that is aware of the current plan step.
+    Build an executor prompt aware of the current plan step.
+
+    IMPORTANT:
+    - In this version, the executor does NOT ask the LLM to create tool calls.
+    - Tool steps are executed by the system directly (using plan_step.tool + plan_step.args).
+    - The LLM is used only for non-tool steps (especially compose_answer).
     """
     prompt = SYSTEM_PROMPT + "\n\n"
     prompt += (
-        f"You are executing step {current_step_index + 1} of {total_steps} "
-        f"in a predefined plan.\n"
+        f"You are executing step {current_step_index + 1} of {total_steps} in a predefined plan.\n"
         f"Step id: {plan_step.id}\n"
         f"Step description: {plan_step.description}\n"
         f"Required tool for this step (if any): {plan_step.tool}\n"
-        "Do NOT change the overall plan. Only work on this step.\n\n"
+        "Do NOT change the overall plan.\n\n"
     )
 
-    prompt += "User: " + user_input + "\n"
+    prompt += "User: " + (user_input or "").strip() + "\n"
 
     if observations:
-        prompt += "\nObservations so far:\n"
+        prompt += "\nObservations so far (ground truth):\n"
         for idx, obs in enumerate(observations, start=1):
             prompt += f"{idx}) {obs}\n"
 
@@ -43,7 +50,9 @@ def build_step_aware_prompt(
 
 def parse_react_response(text: str) -> Dict[str, Optional[str]]:
     """
-    Parse a ReAct-style response into Thought / Action / Final Answer.
+    Parse a response into Thought / Action / Final Answer.
+    We keep this for compatibility with your prompt format,
+    but we do NOT rely on Action for tool calls anymore.
     """
     thought = action = final_answer = None
     lines = text.splitlines()
@@ -77,43 +86,11 @@ def parse_react_response(text: str) -> Dict[str, Optional[str]]:
     return {"thought": thought, "action": action, "final_answer": final_answer}
 
 
-def maybe_parse_tool_call(action_text: str) -> Optional[Dict[str, Any]]:
-    """
-    Parse CALL_TOOL:tool_name({...})
-    """
-    if not action_text or not action_text.startswith("CALL_TOOL:"):
-        return None
-
-    rest = action_text[len("CALL_TOOL:") :].strip()
-    open_i = rest.find("(")
-    close_i = rest.rfind(")")
-
-    if open_i == -1 or close_i == -1:
-        return None
-
-    tool = rest[:open_i].strip()
-    args_str = rest[open_i + 1 : close_i].strip()
-
-    if not tool:
-        return None
-
-    try:
-        args = json.loads(args_str) if args_str else {}
-    except json.JSONDecodeError:
-        return None
-
-    return {"tool_name": tool, "args": args}
-
-
 def _is_placeholder_final_answer(text: Optional[str]) -> bool:
-    """
-    Detect common "placeholder" answers that should NOT be accepted as completion.
-    """
     if not text:
         return True
     t = text.strip().lower()
 
-    # Common placeholders your runs show
     placeholders = {
         "(waiting for observations)",
         "(waiting for tool result)",
@@ -127,7 +104,6 @@ def _is_placeholder_final_answer(text: Optional[str]) -> bool:
     if t in placeholders:
         return True
 
-    # Also treat very short "waiting" style outputs as placeholders
     if "waiting for" in t and len(t) <= 80:
         return True
 
@@ -135,9 +111,6 @@ def _is_placeholder_final_answer(text: Optional[str]) -> bool:
 
 
 def _stable_args_key(args: Dict[str, Any]) -> str:
-    """
-    Stable JSON key for args dict (for retry detection).
-    """
     try:
         return json.dumps(args, sort_keys=True, separators=(",", ":"))
     except Exception:
@@ -163,7 +136,6 @@ class Plan:
 class AgentState:
     user_input: str
     observations: List[str] = field(default_factory=list)
-    step: int = 0
 
     tools_used: Dict[str, int] = field(default_factory=dict)
     last_tool_name: Optional[str] = None
@@ -175,13 +147,16 @@ class AgentState:
     current_step: int = 0
     replan_count: int = 0
 
-    # Track tool failures to avoid infinite loops / pointless retries
     failed_tool_calls: Set[Tuple[str, str]] = field(default_factory=set)
 
 
 class SimpleAgent:
     """
-    Planner + ReAct Executor with Dynamic Replanning.
+    Planner + Executor with Dynamic Replanning.
+
+    Key change vs your previous version:
+    - Tool steps are executed directly using the plan (step.tool + step.args).
+    - The LLM is used only to write the final answer (compose) and other non-tool steps.
     """
 
     def __init__(self, planner: Optional["Planner"] = None) -> None:
@@ -192,8 +167,7 @@ class SimpleAgent:
         self.planner = planner
         self.max_replans = 2
 
-        # Tools that are allowed to fail and/or be retried (intentional or transient)
-        self.allow_retry_tools = {"fetch_url"}  # network can be transient
+        self.allow_retry_tools = {"fetch_url"}            # transient
         self.intentional_failure_tools = {"always_fail"}  # by design
 
     def _debug_replan(self, reason: str, step: PlanStep, observations: List[str]) -> None:
@@ -210,12 +184,10 @@ class SimpleAgent:
         return self._execute_plan(state)
 
     def _already_failed(self, state: AgentState, tool_name: str, args: Dict[str, Any]) -> bool:
-        key = (tool_name, _stable_args_key(args))
-        return key in state.failed_tool_calls
+        return (tool_name, _stable_args_key(args)) in state.failed_tool_calls
 
     def _mark_failed(self, state: AgentState, tool_name: str, args: Dict[str, Any]) -> None:
-        key = (tool_name, _stable_args_key(args))
-        state.failed_tool_calls.add(key)
+        state.failed_tool_calls.add((tool_name, _stable_args_key(args)))
 
     def _execute_plan(self, state: AgentState) -> str:
         if not state.plan:
@@ -227,6 +199,67 @@ class SimpleAgent:
             react_step += 1
             step = state.plan.steps[state.current_step]
 
+            # ============================================================
+            # TOOL STEP: execute tool directly (no LLM call needed)
+            # ============================================================
+            if step.tool is not None:
+                tool_name = step.tool
+                args = step.args or {}
+
+                # Safety: tool must exist
+                if tool_name not in TOOLS:
+                    return self._replan_or_exit(state, step, f"Unknown tool in plan: '{tool_name}'")
+
+                # Prevent pointless repeats of the exact same failing call,
+                # but DO NOT block intentional failure tools like always_fail.
+                if (
+                    tool_name not in self.intentional_failure_tools
+                    and tool_name not in self.allow_retry_tools
+                    and self._already_failed(state, tool_name, args)
+                ):
+                    return self._replan_or_exit(
+                        state,
+                        step,
+                        f"Tool '{tool_name}' previously failed with the same args; refusing to retry.",
+                    )
+
+                result, failed = self._call_tool(tool_name, args)
+
+                obs = (
+                    f"The tool '{tool_name}' was called with arguments {json.dumps(args)} "
+                    f"and returned this result: {result}"
+                )
+                state.observations.append(obs)
+
+                state.tools_used[tool_name] = state.tools_used.get(tool_name, 0) + 1
+                state.last_tool_name = tool_name
+                state.last_tool_args = args
+                state.last_tool_result = result
+
+                if failed:
+                    # If the failure is intentional (e.g., always_fail), we do NOT replan.
+                    # We keep the observation and continue so compose_answer can explain it.
+                    if tool_name in self.intentional_failure_tools:
+                        state.current_step += 1
+                        continue
+
+                    self._mark_failed(state, tool_name, args)
+                    return self._replan_or_exit(state, step, result)
+
+                state.current_step += 1
+                continue
+
+            # ============================================================
+            # NON-TOOL STEP
+            # - Only call LLM for compose_answer
+            # - Skip LLM for intermediate non-tool steps (deterministic)
+            # ============================================================
+            if step.id != "compose_answer":
+                state.observations.append(f"Non-tool step '{step.id}' skipped (deterministic).")
+                state.current_step += 1
+                continue
+
+            # compose_answer: ask LLM to write the final response
             prompt = build_step_aware_prompt(
                 state.user_input,
                 state.observations,
@@ -241,89 +274,22 @@ class SimpleAgent:
             response = call_llm(prompt)
             state.last_llm_response = response
             parts = parse_react_response(response)
-
-            action = parts["action"]
             final_answer = parts["final_answer"]
 
-            action_text = None
-            if action and action.strip().upper() != "NONE":
-                action_text = action.strip()
-
-            # === Non-tool steps ===
-            if step.tool is None:
-                # Must not call tools in non-tool steps
-                if action_text:
-                    return self._replan_or_exit(state, step, f"Unexpected tool call: {action_text}")
-
-                # Placeholder / empty final answer is NOT acceptable, especially for compose_answer
-                if _is_placeholder_final_answer(final_answer):
-                    return self._replan_or_exit(
-                        state,
-                        step,
-                        f"Non-tool step '{step.id}' produced no usable final answer (placeholder/empty).",
-                    )
-
-                # Final step must return the composed answer
-                if step.id == "compose_answer":
-                    return final_answer  # type: ignore[return-value]
-
-                # Intermediate non-tool step: store as observation, then continue
-                state.observations.append(f"Non-tool step '{step.id}' result: {final_answer}")
-                state.current_step += 1
-                continue
-
-            # === Tool steps ===
-            if not action_text:
-                return self._replan_or_exit(state, step, "No tool call produced.")
-
-            tool_call = maybe_parse_tool_call(action_text)
-            if not tool_call:
-                return self._replan_or_exit(state, step, f"Invalid tool call: {action_text}")
-
-            tool_name = tool_call["tool_name"]
-            args = tool_call["args"]
-
-            if tool_name != step.tool:
+            if _is_placeholder_final_answer(final_answer):
                 return self._replan_or_exit(
                     state,
                     step,
-                    f"Wrong tool called: expected {step.tool}, got {tool_name}",
+                    "compose_answer produced no usable final answer (placeholder/empty).",
                 )
 
-            # Prevent pointless repeats of the exact same failing call,
-            # but DO NOT block intentional failure tools like always_fail.
-            if (
-                tool_name not in self.intentional_failure_tools
-                and tool_name not in self.allow_retry_tools
-                and self._already_failed(state, tool_name, args)
-            ):
-                return self._replan_or_exit(
-                    state,
-                    step,
-                    f"Tool '{tool_name}' previously failed with the same args; refusing to retry.",
-                )
+            return final_answer  # type: ignore[return-value]
 
-            result, failed = self._call_tool(tool_name, args)
-
-            obs = (
-                f"The tool '{tool_name}' was called with arguments {json.dumps(args)} "
-                f"and returned this result: {result}"
-            )
-            state.observations.append(obs)
-
-            # Track usage / last call metadata
-            state.tools_used[tool_name] = state.tools_used.get(tool_name, 0) + 1
-            state.last_tool_name = tool_name
-            state.last_tool_args = args
-            state.last_tool_result = result
-
-            if failed:
-                self._mark_failed(state, tool_name, args)
-                return self._replan_or_exit(state, step, result)
-
-            state.current_step += 1
-
-        return state.last_llm_response or "I was unable to complete the request."
+        # Fallback: if we exit loop without returning (e.g., no compose_answer, or step limit hit)
+        return state.last_llm_response or (
+            "I was unable to complete the request.\n"
+            + ("Observations:\n" + "\n".join(state.observations[-10:]) if state.observations else "")
+        )
 
     def _call_tool(self, tool_name: str, args: Dict[str, Any]) -> Tuple[str, bool]:
         tool = TOOLS[tool_name]

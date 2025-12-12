@@ -1,12 +1,15 @@
 # planner.py
 
 import json
-from typing import Any, Dict, List
+import re
+from typing import Any, Dict, List, Optional
+from datetime import datetime
 
 from llm_client import call_llm
-from prompts import PLANNER_SYSTEM_PROMPT, PLANNER_REPLAN_SUFFIX
 from tools import TOOLS
 from agent import Plan, PlanStep
+from config import PROMPT_MODE
+from prompts import get_planner_prompt, PLANNER_REPLAN_SUFFIX
 
 
 class Planner:
@@ -16,11 +19,18 @@ class Planner:
     - Tool-aware (includes tool list + JSON schemas)
     - Enforces a final compose_answer step (tool=null)
     - Supports replanning with observations + failure context
-    - Robust to non-JSON LLM outputs via a JSON-repair pass
+    - Robust to non-JSON LLM outputs via:
+        1) deterministic local JSON repairs
+        2) optional LLM JSON-repair pass
     - Normalizes plans so every step ALWAYS has: id, description, tool, args, requires
+    - Prunes intermediate non-tool steps (tool=null) so executor only needs LLM for compose_answer
     """
 
-    MAX_JSON_REPAIR_ATTEMPTS = 2
+    MAX_JSON_REPAIR_ATTEMPTS = 2  # LLM repair attempts (after local repairs)
+
+    # ---------------------------------------------------------------------
+    # Public entry
+    # ---------------------------------------------------------------------
 
     def generate_plan(
         self,
@@ -43,20 +53,31 @@ class Planner:
         )
 
         print("\n" + "=" * 80)
-        print("[PLANNER DEBUG] FULL PROMPT SENT TO LLM:\n")
+        print("[PLANNER DEBUG] FULL PROMPT SENT TO LLM:\n " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         print(prompt)
         print("=" * 80 + "\n")
 
         raw = call_llm(prompt)
 
         print("\n" + "=" * 80)
-        print("[PLANNER DEBUG] RAW RESPONSE FROM LLM:\n")
+        print("[PLANNER DEBUG] RAW RESPONSE FROM LLM:\n " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         print(raw)
         print("=" * 80 + "\n")
 
-        plan_json = self._parse_or_repair_json(raw, original_prompt=prompt)
+        plan_json = self._parse_or_repair_json(
+            raw,
+            original_prompt=prompt,
+            observations_text=observations_text,
+            failure_text=failure_text,
+            is_replan=is_replan,
+        )
+
         self._debug_plan_summary(plan_json)
         return self._to_plan(plan_json)
+
+    # ---------------------------------------------------------------------
+    # Prompt construction
+    # ---------------------------------------------------------------------
 
     def _build_tools_spec(self) -> str:
         lines: List[str] = ["Available tools:"]
@@ -85,8 +106,11 @@ class Planner:
         is_replan: bool,
     ) -> str:
         base = (
-            PLANNER_SYSTEM_PROMPT
-            + "\n\n"
+            get_planner_prompt(PROMPT_MODE)
+            + "\n\nIMPORTANT:\n"
+            + "- Do NOT create intermediate non-tool steps (tool=null).\n"
+            + "- The ONLY non-tool step allowed is the FINAL 'compose_answer' step.\n"
+            + "- If you need to 'use observations', do it inside compose_answer, not as separate steps.\n\n"
             + tools_spec
             + "\n\nUser request:\n"
             + user_input
@@ -105,57 +129,89 @@ class Planner:
         base += "\n\nReturn ONLY the Plan JSON now."
         return base
 
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
     # JSON parsing + repair
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
 
-    def _parse_or_repair_json(self, raw: str, *, original_prompt: str) -> Dict[str, Any]:
+    def _parse_or_repair_json(
+        self,
+        raw: str,
+        *,
+        original_prompt: str,
+        observations_text: str,
+        failure_text: str,
+        is_replan: bool,
+    ) -> Dict[str, Any]:
         """
-        Try to parse JSON. If it fails, attempt a JSON-repair pass by asking the LLM
-        to output valid JSON ONLY.
+        Strategy:
+        1) Deterministically extract candidate JSON and apply local fixes.
+        2) Try json.loads.
+        3) If still failing, do up to MAX_JSON_REPAIR_ATTEMPTS LLM repair calls,
+           but *always* wrap bad output as an escaped JSON string in the repair prompt,
+           then run local fixes again before parsing.
         """
-        last_err: Exception | None = None
-        text = raw
+        last_err: Optional[Exception] = None
+        text = raw or ""
+
+        # First pass: local extraction + fixes (no LLM)
+        text = self._extract_json_candidate(text)
+        text = self._local_json_fixes(text)
 
         for attempt in range(self.MAX_JSON_REPAIR_ATTEMPTS + 1):
             try:
-                return self._parse_json(text)
+                return self._parse_json(
+                    text,
+                    observations_text=observations_text,
+                    failure_text=failure_text,
+                    is_replan=is_replan,
+                )
             except Exception as e:
                 last_err = e
                 if attempt >= self.MAX_JSON_REPAIR_ATTEMPTS:
                     break
 
-                # Repair attempt
-                repair_prompt = self._build_json_repair_prompt(bad_output=text, original_prompt=original_prompt)
+                repair_prompt = self._build_json_repair_prompt(
+                    bad_output=text, original_prompt=original_prompt
+                )
+
                 print("\n" + "=" * 80)
                 print(f"[PLANNER DEBUG] JSON REPAIR ATTEMPT {attempt+1} PROMPT SENT TO LLM:\n")
                 print(repair_prompt)
                 print("=" * 80 + "\n")
 
-                text = call_llm(repair_prompt)
+                text = call_llm(repair_prompt) or ""
 
                 print("\n" + "=" * 80)
                 print(f"[PLANNER DEBUG] JSON REPAIR ATTEMPT {attempt+1} RAW RESPONSE FROM LLM:\n")
                 print(text)
                 print("=" * 80 + "\n")
 
-        raise ValueError(f"Planner output was not valid JSON after repair attempts. Last error: {last_err}\n\nRaw:\n{raw}")
+                # Always re-extract + locally fix after LLM repair
+                text = self._extract_json_candidate(text)
+                text = self._local_json_fixes(text)
+
+        raise ValueError(
+            f"Planner output was not valid JSON after repair attempts. "
+            f"Last error: {last_err}\n\nRaw:\n{raw}"
+        )
 
     def _build_json_repair_prompt(self, *, bad_output: str, original_prompt: str) -> str:
         """
-        A strict prompt to coerce the model into returning only valid JSON matching our schema.
+        IMPORTANT: embed bad_output as a JSON string (escaped) so it can't break this prompt.
         """
+        bad_output_escaped = json.dumps(bad_output)
+
         return (
             "You are a JSON repair utility.\n"
             "You MUST return VALID JSON ONLY.\n"
             "No prose, no markdown, no code fences.\n\n"
-            "The JSON MUST match this schema exactly:\n"
+            "Return a JSON object matching this schema exactly:\n"
             "{\n"
             '  "goal": "<string>",\n'
             '  "steps": [\n'
             "    {\n"
-            '      "id": "<short identifier for this step>",\n'
-            '      "description": "<natural language description>",\n'
+            '      "id": "<short identifier>",\n'
+            '      "description": "<string>",\n'
             '      "tool": "<tool name or null>",\n'
             '      "args": { ... } or null,\n'
             '      "requires": ["<ids>"]\n'
@@ -165,25 +221,24 @@ class Planner:
             "Constraints:\n"
             "- Every step MUST include: id, description, tool, args, requires.\n"
             '- The FINAL step MUST have id="compose_answer", tool=null, args=null.\n'
-            '- compose_answer.requires MUST include every prior step id.\n'
+            "- Do NOT include any non-tool steps (tool=null) except compose_answer.\n"
+            "- compose_answer.requires MUST include every prior step id.\n"
             "- Tools must be one of the tools listed in the original prompt.\n\n"
             "Original planner instructions (for context):\n"
             + original_prompt
-            + "\n\nBad model output to repair:\n"
-            + bad_output
+            + "\n\nBad model output to repair (as an escaped string):\n"
+            + bad_output_escaped
             + "\n\nReturn ONLY the repaired Plan JSON now."
         )
 
-    def _parse_json(self, raw: str) -> Dict[str, Any]:
-        """
-        Parse the raw LLM output into a dict with 'goal' and 'steps'.
-
-        Supports:
-        - Pure JSON object with {goal, steps}
-        - JSON object wrapped in ``` fences (even if there is text around it)
-        - Extract-first-object strategy for messy outputs
-        - If it returns a bare array of tool calls, we normalise it
-        """
+    def _parse_json(
+        self,
+        raw: str,
+        *,
+        observations_text: str,
+        failure_text: str,
+        is_replan: bool,
+    ) -> Dict[str, Any]:
         if raw is None:
             raise ValueError("Planner output was empty (None).")
 
@@ -191,7 +246,7 @@ class Planner:
         if not text:
             raise ValueError("Planner output was empty string.")
 
-        # 0) Strip outer ``` fences if present
+        # Strip ``` fences if any slipped through
         if "```" in text:
             first = text.find("```")
             last = text.rfind("```")
@@ -203,215 +258,265 @@ class Planner:
                         inner = inner[nl + 1 :]
                 text = inner.strip()
 
-        # 1) Direct parse
-        try:
-            data = json.loads(text)
-            return self._normalise_plan_json(data)
-        except json.JSONDecodeError:
-            pass
+        # One more deterministic cleanup before loads
+        text = self._extract_json_candidate(text)
+        text = self._local_json_fixes(text)
 
-        # 2) Extract first {...} or [...]
-        start_obj = text.find("{")
-        start_arr = text.find("[")
-        starts = [i for i in [start_obj, start_arr] if i != -1]
-        if starts:
-            start = min(starts)
-            end_obj = text.rfind("}")
-            end_arr = text.rfind("]")
-            end = max(end_obj, end_arr)
-            if end != -1 and end > start:
-                candidate = text[start : end + 1]
-                data = json.loads(candidate)
-                return self._normalise_plan_json(data)
+        data = json.loads(text)
+        return self._normalise_plan_json(
+            data,
+            observations_text=observations_text,
+            failure_text=failure_text,
+            is_replan=is_replan,
+        )
 
-        raise ValueError(f"Planner output was not valid JSON in any supported format:\n{raw}")
+    # ---------------------------------------------------------------------
+    # Deterministic JSON hardening
+    # ---------------------------------------------------------------------
 
-    # -------------------------------------------------------------------------
-    # Normalisation / hardening
-    # -------------------------------------------------------------------------
+    def _extract_json_candidate(self, text: str) -> str:
+        """
+        Extract the first JSON object/array from a messy blob.
+        If already clean, returns as-is.
+        """
+        if not text:
+            return text
+        t = text.strip()
 
-    def _normalise_plan_json(self, data: Any) -> Dict[str, Any]:
-        # Case 1: expected shape
+        # Fast path
+        if (t.startswith("{") and t.endswith("}")) or (t.startswith("[") and t.endswith("]")):
+            return t
+
+        # Find first { or [
+        start_obj = t.find("{")
+        start_arr = t.find("[")
+        starts = [i for i in (start_obj, start_arr) if i != -1]
+        if not starts:
+            return t
+
+        start = min(starts)
+        end = max(t.rfind("}"), t.rfind("]"))
+        if end == -1 or end <= start:
+            return t
+
+        return t[start : end + 1].strip()
+
+    def _local_json_fixes(self, text: str) -> str:
+        """
+        Fix common LLM JSON issues deterministically.
+        - URL corruption inside quoted strings: "https":// -> https://
+        - Unquoted keys like: bullets: 3  -> "bullets": 3
+        """
+        if not text:
+            return text
+
+        t = text
+
+        # Fix URL corruption everywhere (safe even if it doesn't occur)
+        t = t.replace('"https"://', "https://")
+        t = t.replace('"http"://', "http://")
+
+        # Quote bare keys like: { bullets: 3 } or , bullets: 3
+        # Only applies when the key is not already quoted.
+        t = re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)', r'\1"\2"\3', t)
+
+        return t
+
+    # ---------------------------------------------------------------------
+    # Normalisation / guardrails
+    # ---------------------------------------------------------------------
+
+    def _normalise_plan_json(
+        self,
+        data: Any,
+        *,
+        observations_text: str,
+        failure_text: str,
+        is_replan: bool,
+    ) -> Dict[str, Any]:
         if isinstance(data, dict) and "steps" in data:
             plan = data
-        # Case 2: bare list of tool calls -> wrap
         elif isinstance(data, list):
-            steps: List[Dict[str, Any]] = []
-            for idx, item in enumerate(data):
-                if not isinstance(item, dict) or "tool" not in item:
-                    continue
-                tool = item.get("tool")
-                args = item.get("args", {})
-                step_id = f"step_{idx+1}"
-                steps.append(
-                    {
-                        "id": step_id,
-                        "description": f"Call tool '{tool}'.",
-                        "tool": tool,
-                        "args": args,
-                        "requires": [],
-                    }
-                )
-            plan = {"goal": "Autogenerated plan from tool-call list.", "steps": steps}
+            steps = []
+            for i, item in enumerate(data):
+                if isinstance(item, dict) and "tool" in item:
+                    steps.append(
+                        {
+                            "id": f"step_{i+1}",
+                            "description": f"Call tool '{item.get('tool')}'.",
+                            "tool": item.get("tool"),
+                            "args": item.get("args", {}),
+                            "requires": [],
+                        }
+                    )
+            plan = {"goal": "Autogenerated plan.", "steps": steps}
         else:
             raise ValueError(f"Unsupported planner JSON shape: {type(data)}")
 
         plan = self._ensure_compose_answer(plan)
         plan = self._ensure_step_fields(plan)
+        plan = self._sanitize_requires(plan)
+        plan = self._prune_non_tool_steps(plan)
+
+        plan = self._ensure_replan_has_summary_step(
+            plan=plan,
+            observations_text=observations_text,
+            failure_text=failure_text,
+            is_replan=is_replan,
+        )
+
         self._validate_tools(plan)
         return plan
 
-    def _ensure_compose_answer(self, plan: Dict[str, Any]) -> Dict[str, Any]:
-        steps: List[Dict[str, Any]] = plan.get("steps", [])
-        if not isinstance(steps, list):
-            raise ValueError("Planner JSON 'steps' must be a list.")
-
-        # Ensure goal exists
-        if "goal" not in plan or not isinstance(plan.get("goal"), str):
-            plan["goal"] = str(plan.get("goal") or "").strip()
-
-        # Check if compose_answer already exists
-        has_compose = any(isinstance(s, dict) and s.get("id") == "compose_answer" for s in steps)
-        if not has_compose:
-            requires = [s.get("id") for s in steps if isinstance(s, dict) and s.get("id")]
-            steps.append(
-                {
-                    "id": "compose_answer",
-                    "description": "Read all previous step results and produce a single coherent answer for the user.",
-                    "tool": None,
-                    "args": None,
-                    "requires": requires,
-                }
-            )
-            plan["steps"] = steps
+    def _ensure_replan_has_summary_step(
+        self,
+        *,
+        plan: Dict[str, Any],
+        observations_text: str,
+        failure_text: str,
+        is_replan: bool,
+    ) -> Dict[str, Any]:
+        if not is_replan:
             return plan
 
-        # If compose exists, force it to be last and force tool/args null
-        # (This avoids models putting compose_answer in the middle.)
-        compose = None
-        rest = []
-        for s in steps:
-            if isinstance(s, dict) and s.get("id") == "compose_answer":
-                compose = s
-            else:
-                rest.append(s)
-
-        if compose is None:
-            plan["steps"] = steps
+        steps = plan.get("steps", [])
+        has_tool = any(s.get("tool") for s in steps if isinstance(s, dict))
+        if has_tool:
             return plan
 
-        compose["tool"] = None
-        compose["args"] = None
-        compose.setdefault(
-            "description",
-            "Read all previous step results and produce a single coherent answer for the user.",
-        )
+        payload = (failure_text or "").strip()
+        obs = (observations_text or "").strip()
+        if obs:
+            payload = (payload + "\n\nObservations:\n" + obs).strip()
 
-        # Make compose depend on all non-compose steps
-        compose["requires"] = [s.get("id") for s in rest if isinstance(s, dict) and s.get("id")]
+        if not payload:
+            return plan
 
-        plan["steps"] = rest + [compose]
+        plan["steps"] = [
+            {
+                "id": "summarize_failure",
+                "description": "Summarise the failure and observations.",
+                "tool": "summarize_text",
+                "args": {"text": payload, "bullets": 3},
+                "requires": [],
+            },
+            {
+                "id": "compose_answer",
+                "description": "Produce final answer from summary.",
+                "tool": None,
+                "args": None,
+                "requires": ["summarize_failure"],
+            },
+        ]
         return plan
 
-    def _ensure_step_fields(self, plan: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Guarantee every step contains the keys expected by the runtime.
-        This prevents KeyError crashes like: 'description'
-        """
-        steps: List[Dict[str, Any]] = plan.get("steps", [])
-        fixed: List[Dict[str, Any]] = []
+    # ---------------------------------------------------------------------
+    # Utilities
+    # ---------------------------------------------------------------------
 
-        for idx, s in enumerate(steps):
-            if not isinstance(s, dict):
-                s = {}
+    def _sanitize_requires(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        steps = plan.get("steps", [])
+        ids = {s.get("id") for s in steps if isinstance(s, dict) and s.get("id")}
 
-            step_id = s.get("id") or f"step_{idx+1}"
-            tool = s.get("tool", None)
-
-            # description: always required
-            desc = s.get("description")
-            if not isinstance(desc, str) or not desc.strip():
-                if step_id == "compose_answer":
-                    desc = "Read all previous step results and produce a single coherent answer for the user."
-                elif tool:
-                    desc = f"Call tool '{tool}'."
-                else:
-                    desc = "Perform a non-tool reasoning step."
-
-            # requires: always a list
+        for s in steps:
             req = s.get("requires", [])
             if req is None:
                 req = []
             if not isinstance(req, list):
                 req = [req]
+            s["requires"] = [r for r in req if isinstance(r, str) and r in ids]
 
-            # args: ensure null for tool=null; otherwise ensure dict or null
-            args = s.get("args", None)
-            if tool is None:
-                args = None
-            else:
-                if args is None:
-                    args = {}
-                if not isinstance(args, dict):
-                    # last resort: wrap
-                    args = {"value": args}
+        for i, s in enumerate(steps):
+            if s.get("id") == "compose_answer":
+                s["requires"] = [x.get("id") for x in steps[:i] if isinstance(x, dict) and x.get("id")]
 
-            fixed.append(
+        return plan
+
+    def _prune_non_tool_steps(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        steps = plan.get("steps", [])
+        tools = [s for s in steps if isinstance(s, dict) and s.get("tool") is not None]
+        compose = next((s for s in steps if isinstance(s, dict) and s.get("id") == "compose_answer"), None)
+
+        if compose is None:
+            compose = {
+                "id": "compose_answer",
+                "description": "Produce final answer.",
+                "tool": None,
+                "args": None,
+                "requires": [],
+            }
+
+        compose["tool"] = None
+        compose["args"] = None
+
+        plan["steps"] = tools + [compose]
+        return plan
+
+    def _ensure_compose_answer(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        steps = plan.get("steps", [])
+        if not isinstance(steps, list):
+            steps = []
+
+        if not any(isinstance(s, dict) and s.get("id") == "compose_answer" for s in steps):
+            steps.append(
                 {
-                    "id": step_id,
-                    "description": desc,
-                    "tool": tool,
-                    "args": args,
-                    "requires": req,
+                    "id": "compose_answer",
+                    "description": "Produce final answer.",
+                    "tool": None,
+                    "args": None,
+                    "requires": [s.get("id") for s in steps if isinstance(s, dict) and s.get("id")],
                 }
             )
 
-        plan["steps"] = fixed
+        plan["steps"] = steps
+        return plan
+
+    def _ensure_step_fields(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        out = []
+        for i, s in enumerate(plan.get("steps", [])):
+            if not isinstance(s, dict):
+                continue
+            tool = s.get("tool")
+            out.append(
+                {
+                    "id": s.get("id", f"step_{i+1}"),
+                    "description": s.get("description", ""),
+                    "tool": tool,
+                    "args": None if tool is None else (s.get("args") if isinstance(s.get("args"), dict) else {}),
+                    "requires": s.get("requires", []) if isinstance(s.get("requires", []), list) else [],
+                }
+            )
+        plan["steps"] = out
         return plan
 
     def _validate_tools(self, plan: Dict[str, Any]) -> None:
-        """
-        Fail early if planner invents tools.
-        """
         allowed = set(TOOLS.keys())
         for s in plan.get("steps", []):
-            tool = s.get("tool")
-            if tool is None:
+            if not isinstance(s, dict):
                 continue
-            if tool not in allowed:
-                raise ValueError(f"Planner invented unknown tool '{tool}'. Allowed: {sorted(allowed)}")
-
-    # -------------------------------------------------------------------------
-    # Conversion / debug
-    # -------------------------------------------------------------------------
+            tool = s.get("tool")
+            if tool and tool not in allowed:
+                raise ValueError(f"Planner invented unknown tool '{tool}'.")
 
     def _to_plan(self, data: Dict[str, Any]) -> Plan:
-        steps_data = data.get("steps", [])
-        steps: List[PlanStep] = []
-
-        for s in steps_data:
-            step = PlanStep(
-                id=s["id"],
-                description=s.get("description") or "",
-                tool=s.get("tool"),
-                args=s.get("args"),
-                requires=s.get("requires", []),
-            )
-            steps.append(step)
-
-        return Plan(goal=data.get("goal", ""), steps=steps)
+        return Plan(
+            goal=data.get("goal", ""),
+            steps=[
+                PlanStep(
+                    id=s["id"],
+                    description=s.get("description", ""),
+                    tool=s.get("tool"),
+                    args=s.get("args"),
+                    requires=s.get("requires", []),
+                )
+                for s in data.get("steps", [])
+                if isinstance(s, dict)
+            ],
+        )
 
     def _debug_plan_summary(self, data: Dict[str, Any]) -> None:
-        goal = data.get("goal", "")
-        steps = data.get("steps", [])
         print("[PLANNER DEBUG] Parsed plan summary:")
-        print(f"  Goal: '{goal}'")
-        print(f"  Steps: {len(steps)}")
-        for s in steps:
-            print(
-                f"    - id='{s.get('id')}', "
-                f"tool='{s.get('tool')}', "
-                f"desc='{s.get('description')}', "
-                f"requires={s.get('requires', [])}"
-            )
+        print(f"  Goal: {data.get('goal')}")
+        for s in data.get("steps", []):
+            print(f"    - {s.get('id')} | tool={s.get('tool')} | requires={s.get('requires')}")
         print()

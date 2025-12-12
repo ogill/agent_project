@@ -21,25 +21,36 @@ You have built a local multi-step Agentic AI system with a clean pipeline:
 
 
 
+# main.py
+
 from agent import SimpleAgent
 from io_utils import get_user_input, print_agent_response
 from config import MODEL_NAME
 
-def main():
+
+def main() -> None:
     print(f"ReAct Agent via Ollama ({MODEL_NAME})")
     print("Type 'exit' or 'quit' to stop.\n")
 
     agent = SimpleAgent()
 
     while True:
-        user_input = get_user_input()
-        if user_input.lower() in {"exit", "quit"}:
+        try:
+            user_input = get_user_input()
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting.")
+            break
+
+        if not user_input or not user_input.strip():
+            continue
+
+        if user_input.strip().lower() in {"exit", "quit"}:
             break
 
         try:
-            answer = agent.handle_turn(user_input)
+            answer = agent.handle_turn(user_input.strip())
         except Exception as e:
-            print(f"[ERROR] Agent failed: {e}")
+            print(f"[ERROR] Agent failed: {e!r}")
             continue
 
         print_agent_response(answer)

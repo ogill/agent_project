@@ -4,7 +4,8 @@
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
 # Default model
-MODEL_NAME = "deepseek-r1:8b"
+#MODEL_NAME = "deepseek-r1:8b"
+MODEL_NAME = "qwen2.5:7b-instruct"
 
 # Enable or disable debug logging for the agent
 DEBUG_AGENT = True  # set to False to turn off debug logs
@@ -28,3 +29,7 @@ MAX_REPLANS = 2
 # Increase time budget because replanning can add extra LLM calls
 # (Optional but recommended)
 LLM_TIMEOUT_SECONDS = 300
+
+PROMPT_MODE = "strict"  # "fast" or "strict"
+if PROMPT_MODE not in ("fast", "strict"):
+    raise ValueError(f"Invalid PROMPT_MODE: {PROMPT_MODE}")
