@@ -1,35 +1,16 @@
 # config.py
 
-# Local Ollama endpoint
-OLLAMA_URL = "http://localhost:11434/api/generate"
+PROMPT_MODE = "strict"  # kept for compatibility with prompts.get_planner_prompt()
 
-# Default model
-#MODEL_NAME = "deepseek-r1:8b"
 MODEL_NAME = "qwen2.5:7b-instruct"
 
-# Enable or disable debug logging for the agent
-DEBUG_AGENT = True  # set to False to turn off debug logs
-
-# If True, also print the full prompts sent to the LLM (can be noisy)
-DEBUG_AGENT_PROMPTS = True
-
-# Maximum number of ReAct reasoning steps per user turn
-MAX_REACT_STEPS = 5
-
-# Planner debug
-DEBUG_PLANNER = True
-
-# -------------------------
-# Stage 4: Dynamic replanning knobs
-# -------------------------
-
-# Maximum times the agent is allowed to replan in a single turn
 MAX_REPLANS = 2
 
-# Increase time budget because replanning can add extra LLM calls
-# (Optional but recommended)
-LLM_TIMEOUT_SECONDS = 300
+# Memory
+MEMORY_ENABLED = True
+MEMORY_DIR = ".memory"
+EPISODES_FILE = "episodes.jsonl"
 
-PROMPT_MODE = "strict"  # "fast" or "strict"
-if PROMPT_MODE not in ("fast", "strict"):
-    raise ValueError(f"Invalid PROMPT_MODE: {PROMPT_MODE}")
+# How much memory to inject each turn
+MAX_RECENT_EPISODES = 6
+MAX_RELEVANT_EPISODES = 2
