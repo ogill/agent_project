@@ -1,11 +1,11 @@
 # tools.py
 
 from __future__ import annotations
+
 import datetime
 import urllib.request
 import urllib.error
-
-from typing import Any, Callable, Dict
+from typing import Any, Dict
 
 from llm_client import call_llm
 from schemas import (
@@ -15,6 +15,7 @@ from schemas import (
     FetchUrlArgs,
     SummarizeTextArgs,
 )
+from pydantic import BaseModel, Field
 
 
 def _fetch_url(url: str) -> str:
@@ -34,6 +35,20 @@ def _fetch_url(url: str) -> str:
 
 def always_fail(reason: str = "forced failure for replanning test") -> str:
     raise RuntimeError(reason)
+
+
+def soft_fail(reason: str = "soft failure for replanning test", retryable: bool = False) -> Dict[str, Any]:
+    """
+    Soft-failure tool: does NOT raise.
+    Returns a structured failure payload so the Agent can trigger replanning
+    without relying on exceptions.
+    """
+    return {
+        "ok": False,
+        "status": "failed",
+        "reason": reason,
+        "retryable": retryable,
+    }
 
 
 def get_time(city: str) -> str:
@@ -59,11 +74,23 @@ def summarize_text(text: str, bullets: int = 3) -> str:
     return call_llm(prompt)
 
 
+# --- Inline schema for soft_fail (keeps change isolated; no need to edit schemas.py yet) ---
+
+class SoftFailArgs(BaseModel):
+    reason: str = Field(default="soft failure for replanning test")
+    retryable: bool = Field(default=False)
+
+
 TOOLS: Dict[str, Dict[str, Any]] = {
     "always_fail": {
         "description": "Always fails intentionally to test dynamic replanning.",
         "args_model": AlwaysFailArgs,
         "fn": lambda **kwargs: always_fail(**AlwaysFailArgs(**kwargs).model_dump()),
+    },
+    "soft_fail": {
+        "description": "Returns a structured failure payload (no exception) to test soft-failure replanning.",
+        "args_model": SoftFailArgs,
+        "fn": lambda **kwargs: soft_fail(**SoftFailArgs(**kwargs).model_dump()),
     },
     "get_time": {
         "description": "Return the current time in a specified city (stubbed).",

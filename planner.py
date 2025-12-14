@@ -1,9 +1,10 @@
 # planner.py
+
 from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 from llm_client import call_llm
 from tools import TOOLS
@@ -40,7 +41,7 @@ class Planner:
     - Safer LLM JSON repair prompt (embeds bad output as escaped JSON string)
     - Normalises steps (id/description/tool/args/requires)
     - Enforces compose_answer final step and dependencies
-    - Replanning is deterministic: we do NOT trust the model plan structure in replan mode
+    - Replanning prefers model output but enforces forbidden tool constraints; falls back only if needed
     """
 
     MAX_JSON_REPAIR_ATTEMPTS = 2
@@ -54,7 +55,10 @@ class Planner:
         failure_text: str = "",
         is_replan: bool = False,
         replan_suffix: str | None = None,
+        forbidden_tools: Set[str] | None = None,
     ) -> Plan:
+        forbidden_tools = forbidden_tools or set()
+
         if not tools_spec:
             tools_spec = self._build_tools_spec()
 
@@ -79,7 +83,7 @@ class Planner:
         print(raw)
         print("=" * 80 + "\n")
 
-        # Parse/repair JSON to keep logging + transparency
+        # Parse/repair JSON
         plan_json = self._parse_or_repair_json(
             raw,
             original_prompt=prompt,
@@ -88,15 +92,21 @@ class Planner:
             is_replan=is_replan,
         )
 
-        # IMPORTANT: in replanning mode, we do NOT trust the model plan structure.
-        # We deterministically build the plan from observed failure/observations.
-        if is_replan:
+        # Enforce replan constraints (e.g., don't call failed tools)
+        # If violated, fall back to deterministic safe replan plan.
+        try:
+            if is_replan and forbidden_tools:
+                self._enforce_forbidden_tools(plan_json, forbidden_tools=forbidden_tools)
+        except Exception as e:
+            print("[PLANNER DEBUG] Replan plan violated constraints; falling back to deterministic replan plan.")
+            print(f"[PLANNER DEBUG] Constraint violation: {e}")
             plan_json = self._deterministic_replan_plan(
                 user_input=user_input,
                 observations_text=observations_text,
                 failure_text=failure_text,
             )
 
+        # Debug + return
         self._debug_plan_summary(plan_json)
         return self._to_plan(plan_json)
 
@@ -141,7 +151,10 @@ class Planner:
             base += (
                 "\n\n"
                 + replan_suffix.strip()
-                + "\n\nObservations so far:\n"
+                + "\n\nIMPORTANT REPLAN CONSTRAINT REMINDER:\n"
+                + "- Do NOT add any non-tool steps (tool=null). The ONLY allowed non-tool step is the FINAL 'compose_answer'.\n"
+                + "- Do NOT invent step IDs in requires; requires must reference real step ids in your plan.\n"
+                + "\nObservations so far:\n"
                 + (observations_text.strip() or "(none)")
                 + "\n\nFailure / blocker encountered:\n"
                 + (failure_text.strip() or "(none)")
@@ -150,7 +163,7 @@ class Planner:
         base += "\n\nReturn ONLY the Plan JSON now."
         return base
 
-    # --------------------------- deterministic replanning ---------------------------
+    # --------------------------- deterministic replanning (fallback) ---------------------------
 
     def _deterministic_replan_plan(
         self,
@@ -160,8 +173,8 @@ class Planner:
         failure_text: str,
     ) -> Dict[str, Any]:
         """
-        Deterministic replanning: never retry failed tools automatically.
-        Always summarise the failure+observations, then compose final answer.
+        Fallback replanning: never retry failed tools automatically.
+        Summarise failure+observations, then compose final answer.
         """
         payload_parts: List[str] = []
         if failure_text.strip():
@@ -171,7 +184,6 @@ class Planner:
 
         payload = "\n\n".join(payload_parts).strip()
 
-        # If somehow empty, still provide a safe structure
         if not payload:
             payload = (
                 "A previous tool call failed, but no failure text or observations were provided. "
@@ -277,6 +289,7 @@ class Planner:
         if not text:
             raise ValueError("Planner output was empty string.")
 
+        # strip code fences if present
         if "```" in text:
             first = text.find("```")
             last = text.rfind("```")
@@ -288,6 +301,7 @@ class Planner:
                         inner = inner[nl + 1 :]
                 text = inner.strip()
 
+        # parse
         try:
             data = json.loads(text)
             return self._normalise_plan_json(
@@ -299,6 +313,7 @@ class Planner:
         except json.JSONDecodeError:
             pass
 
+        # salvage JSON between braces
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
@@ -425,6 +440,7 @@ class Planner:
         steps = plan.get("steps", [])
         ids = {s.get("id") for s in steps}
 
+        # Remove requires pointing to non-existent ids
         for s in steps:
             req = s.get("requires", [])
             if not isinstance(req, list):
@@ -445,6 +461,17 @@ class Planner:
             tool = s.get("tool")
             if tool and tool not in allowed:
                 raise ValueError(f"Planner invented unknown tool '{tool}'.")
+
+    def _enforce_forbidden_tools(self, plan: Dict[str, Any], *, forbidden_tools: Set[str]) -> None:
+        if not forbidden_tools:
+            return
+        violating: Set[str] = set()
+        for s in plan.get("steps", []):
+            tool = s.get("tool")
+            if tool and tool in forbidden_tools:
+                violating.add(tool)
+        if violating:
+            raise ValueError(f"Plan attempted to call forbidden tools: {', '.join(sorted(violating))}")
 
     # --------------------------- conversions / debug ---------------------------
 
