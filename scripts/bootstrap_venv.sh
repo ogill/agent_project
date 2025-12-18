@@ -1,3 +1,7 @@
+#cd agent_project
+#./scripts/bootstrap_venv.sh
+#source .venv/bin/activate
+
 #!/usr/bin/env bash
 set -e
 
@@ -62,3 +66,5 @@ echo "✅ Environment ready!"
 echo "👉 Activate with: source .venv/bin/activate"
 echo "👉 Run tests with: pytest -q"
 echo "👉 Run app with: python main.py"
+
+ollama pull nomic-embed-text      

@@ -29,6 +29,7 @@ class Agent:
         failed_tools: Set[str] = set()
         observations_text = ""
         failure_text = ""
+        last_failure_text = ""  # tracks latest failure in THIS run
 
         # Track retryability decisions for soft failures so the except-block
         # doesn’t incorrectly mark retryable tools as "do not retry".
@@ -93,7 +94,15 @@ class Agent:
 
                 # Compose final answer (do NOT trigger replanning if this fails)
                 try:
-                    final_answer = self._compose_answer(user_input, observations, failed_tools)
+                    # If we had any tool failures earlier in THIS run, pass the latest failure text
+                    # so the model explains the real cause instead of guessing from memory.
+                    compose_failure_text = last_failure_text if failed_tools else ""
+                    final_answer = self._compose_answer(
+                        user_input=user_input,
+                        observations=observations,
+                        failed_tools=failed_tools,
+                        failure_text=compose_failure_text,
+                    )
                 except Exception as e:
                     observations_text = self._format_observations(observations, failed_tools)
                     failure_text = f"Final answer composition failed: {e}"
@@ -105,6 +114,7 @@ class Agent:
             except Exception as e:
                 # ONLY tool / execution failures arrive here
                 failure_text = str(e)
+                last_failure_text = failure_text
 
                 # Extract tool name from hard or soft failure strings
                 tool_name = None
@@ -178,24 +188,30 @@ class Agent:
 
     def _compose_answer(
         self,
+        *,
         user_input: str,
         observations: Dict[str, Any],
         failed_tools: Set[str] | None = None,
+        failure_text: str = "",
     ) -> str:
         from llm_client import call_llm
 
-        memory_context = self.memory.build_context(user_input)
-        obs_text = self._format_observations(observations, failed_tools or set())
+        failed_tools = failed_tools or set()
+        obs_text = self._format_observations(observations, failed_tools)
 
         prompt_parts: List[str] = []
 
-        if memory_context:
-            prompt_parts.append(
-                "Relevant prior context (episodic memory):\n"
-                + memory_context
-                + "\n\nIMPORTANT: Use this prior context ONLY if it is clearly about the SAME request. "
-                  "If it seems unrelated, ignore it completely and do not mention it."
-            )
+        # Key rule: if there was a failure in THIS run, do NOT inject memory.
+        # It causes exactly the bug you saw (model "borrows" an old failure cause like 404).
+        if not failed_tools and not failure_text.strip():
+            memory_context = self.memory.build_context(user_input)
+            if memory_context:
+                prompt_parts.append(
+                    "Relevant prior context (episodic memory):\n"
+                    + memory_context
+                    + "\n\nIMPORTANT: Use prior context ONLY if it is clearly about the SAME request. "
+                      "If it seems unrelated, ignore it completely and do not mention it."
+                )
 
         prompt_parts.append("User request:\n" + user_input)
 
@@ -204,14 +220,21 @@ class Agent:
             + (obs_text if obs_text.strip() else "(none)")
         )
 
+        if failure_text.strip():
+            prompt_parts.append(
+                "Failure encountered in THIS run (ground truth):\n"
+                + failure_text.strip()
+            )
+
         prompt_parts.append(
-                "Write a clear, user-facing response grounded ONLY in the observations from THIS run. "
-                "If any tool failed, you MUST explicitly say: 'The tool <tool_name> failed' (use the word 'failed'). "
-                "Then explain why in plain English. "
-                "Do NOT mention unrelated past failures or prior conversations unless the user explicitly asks."
+            "Write a clear, user-facing response.\n"
+            "- If any tool failed, you MUST explicitly say: 'The tool <tool_name> failed' (use the word 'failed').\n"
+            "- Explain the failure cause ONLY using the Failure text above and/or the Observations above.\n"
+            "- Do NOT invent HTTP status codes or error causes that are not explicitly present.\n"
+            "- Do NOT mention unrelated past failures or prior conversations unless the user explicitly asks."
         )
 
-        prompt = "\n\n---\n\n".join(prompt_parts)
+        prompt = "\n\n".join(prompt_parts)
         return call_llm(prompt)
 
     def _fallback_answer(self, user_input: str, observations_text: str, failure_text: str) -> str:

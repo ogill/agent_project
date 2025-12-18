@@ -1,7 +1,7 @@
-import os
 from pathlib import Path
 
 from agent import Agent
+
 
 def test_fetch_url_nonexistent_domain_does_not_crash(tmp_path, monkeypatch):
     """
@@ -11,16 +11,14 @@ def test_fetch_url_nonexistent_domain_does_not_crash(tmp_path, monkeypatch):
     - Episodic memory should be persisted (episodes.jsonl)
     """
 
-    # Force memory dir into temp so tests don't touch your real .memory/
-    from config import MEMORY_DIR, EPISODES_FILE
-
     test_mem_dir = tmp_path / "memory"
     test_mem_dir.mkdir(parents=True, exist_ok=True)
 
-    # Monkeypatch config values at runtime
+    # Monkeypatch config values at runtime (must stay Path objects)
     import config
-    monkeypatch.setattr(config, "MEMORY_DIR", str(test_mem_dir))
-    monkeypatch.setattr(config, "EPISODES_FILE", "episodes.jsonl")
+    monkeypatch.setattr(config, "MEMORY_DIR", test_mem_dir)
+    monkeypatch.setattr(config, "EPISODES_PATH", test_mem_dir / "episodes.jsonl")
+    monkeypatch.setattr(config, "CHROMA_DIR", test_mem_dir / "chroma")
 
     # Run
     agent = Agent(max_replans=2)

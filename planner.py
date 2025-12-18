@@ -41,7 +41,7 @@ class Planner:
     - Safer LLM JSON repair prompt (embeds bad output as escaped JSON string)
     - Normalises steps (id/description/tool/args/requires)
     - Enforces compose_answer final step and dependencies
-    - Replanning prefers model output but enforces forbidden tool constraints; falls back only if needed
+    - Replanning enforces forbidden tool constraints; falls back only if needed
     """
 
     MAX_JSON_REPAIR_ATTEMPTS = 2
@@ -59,6 +59,41 @@ class Planner:
     ) -> Plan:
         forbidden_tools = forbidden_tools or set()
 
+        # Deterministic shortcut 1: explicit memory WRITE requests should not call tools.
+        if (not is_replan) and self._is_memory_only_request(user_input):
+            plan_json = {
+                "goal": f"Persist the user-provided fact and acknowledge it: {user_input}",
+                "steps": [
+                    {
+                        "id": "compose_answer",
+                        "description": "Acknowledge the user's fact and confirm it has been remembered. Do not call tools.",
+                        "tool": None,
+                        "args": None,
+                        "requires": [],
+                    }
+                ],
+            }
+            self._debug_plan_summary(plan_json)
+            return self._to_plan(plan_json)
+
+        # Deterministic shortcut 2: likely memory RECALL (e.g., "What bike do I like?")
+        # -> let the agent answer from injected memory/context without calling tools.
+        if (not is_replan) and self._is_likely_memory_recall_request(user_input):
+            plan_json = {
+                "goal": f"Answer the user's question using available context/memory: {user_input}",
+                "steps": [
+                    {
+                        "id": "compose_answer",
+                        "description": "Answer using the conversation context/memory. Do not call tools.",
+                        "tool": None,
+                        "args": None,
+                        "requires": [],
+                    }
+                ],
+            }
+            self._debug_plan_summary(plan_json)
+            return self._to_plan(plan_json)
+
         if not tools_spec:
             tools_spec = self._build_tools_spec()
 
@@ -69,6 +104,7 @@ class Planner:
             failure_text=failure_text,
             is_replan=is_replan,
             replan_suffix=replan_suffix or DEFAULT_REPLAN_SUFFIX,
+            forbidden_tools=forbidden_tools,
         )
 
         print("\n" + "=" * 80)
@@ -83,7 +119,7 @@ class Planner:
         print(raw)
         print("=" * 80 + "\n")
 
-        # Parse/repair JSON
+        # Parse + normalise (includes tool validation)
         plan_json = self._parse_or_repair_json(
             raw,
             original_prompt=prompt,
@@ -92,23 +128,78 @@ class Planner:
             is_replan=is_replan,
         )
 
-        # Enforce replan constraints (e.g., don't call failed tools)
-        # If violated, fall back to deterministic safe replan plan.
+        # Enforce forbidden tools (especially during replans).
         try:
-            if is_replan and forbidden_tools:
-                self._enforce_forbidden_tools(plan_json, forbidden_tools=forbidden_tools)
+            self._enforce_forbidden_tools(plan_json, forbidden_tools=forbidden_tools)
         except Exception as e:
-            print("[PLANNER DEBUG] Replan plan violated constraints; falling back to deterministic replan plan.")
-            print(f"[PLANNER DEBUG] Constraint violation: {e}")
-            plan_json = self._deterministic_replan_plan(
-                user_input=user_input,
-                observations_text=observations_text,
-                failure_text=failure_text,
-            )
+            # If the model violates forbidden tools, fall back to deterministic replan plan
+            # that uses NO external tools (compose_answer only).
+            if is_replan:
+                print(f"[PLANNER DEBUG] Model replan violated forbidden tools, falling back. Reason: {e}")
+                plan_json = self._deterministic_replan_plan(
+                    user_input=user_input,
+                    observations_text=observations_text,
+                    failure_text=failure_text,
+                )
+            else:
+                # Non-replan: still treat this as a planning error.
+                raise
 
-        # Debug + return
         self._debug_plan_summary(plan_json)
         return self._to_plan(plan_json)
+
+    def _is_memory_only_request(self, user_input: str) -> bool:
+        s = (user_input or "").lower().strip()
+
+        # Only treat as memory-write when user explicitly asks to store/remember.
+        return (
+            s.startswith("remember:") or
+            s.startswith("remember ") or
+            s.startswith("note:") or
+            s.startswith("note ") or
+            "add this to memory" in s or
+            "store this" in s or
+            "save this" in s or
+            "keep this" in s
+        )
+
+    def _is_likely_memory_recall_request(self, user_input: str) -> bool:
+        """
+        Heuristic: questions that look like "what is my X" / "what do i like" / "which X did i say"
+        should NOT cause tool calls. Let the agent answer from context/memory injection.
+        Avoid triggering for time/weather/url-style questions.
+        """
+        s = (user_input or "").lower().strip()
+
+        # If the user is clearly asking for a tool-requiring thing, do not shortcut.
+        tool_intent_markers = [
+            "time is it",
+            "what time",
+            "weather",
+            "forecast",
+            "fetch ",
+            "fetch the contents",
+            "open ",
+            "http://",
+            "https://",
+            "url",
+        ]
+        if any(m in s for m in tool_intent_markers):
+            return False
+
+        recall_markers = [
+            "what is my ",
+            "what's my ",
+            "what do i like",
+            "what did i say",
+            "what did i tell you",
+            "do you remember",
+            "what is my favourite",
+            "what's my favourite",
+            "which bike do i like",
+            "what bike do i like",
+        ]
+        return any(m in s for m in recall_markers)
 
     # --------------------------- prompt construction ---------------------------
 
@@ -135,7 +226,10 @@ class Planner:
         failure_text: str,
         is_replan: bool,
         replan_suffix: str,
+        forbidden_tools: Set[str] | None = None,
     ) -> str:
+        forbidden_tools = forbidden_tools or set()
+
         base = (
             get_planner_prompt(PROMPT_MODE)
             + "\n\nIMPORTANT:\n"
@@ -154,7 +248,17 @@ class Planner:
                 + "\n\nIMPORTANT REPLAN CONSTRAINT REMINDER:\n"
                 + "- Do NOT add any non-tool steps (tool=null). The ONLY allowed non-tool step is the FINAL 'compose_answer'.\n"
                 + "- Do NOT invent step IDs in requires; requires must reference real step ids in your plan.\n"
-                + "\nObservations so far:\n"
+            )
+
+            if forbidden_tools:
+                base += (
+                    "\n\nFORBIDDEN TOOLS (do not call these in your new plan):\n"
+                    + ", ".join(sorted(forbidden_tools))
+                    + "\n"
+                )
+
+            base += (
+                "\n\nObservations so far:\n"
                 + (observations_text.strip() or "(none)")
                 + "\n\nFailure / blocker encountered:\n"
                 + (failure_text.strip() or "(none)")
@@ -173,40 +277,22 @@ class Planner:
         failure_text: str,
     ) -> Dict[str, Any]:
         """
-        Fallback replanning: never retry failed tools automatically.
-        Summarise failure+observations, then compose final answer.
+        Fallback replanning: do NOT call tools.
+        The agent can explain using failure_text/observations_text already available.
         """
-        payload_parts: List[str] = []
-        if failure_text.strip():
-            payload_parts.append(failure_text.strip())
-        if observations_text.strip():
-            payload_parts.append("Observations:\n" + observations_text.strip())
-
-        payload = "\n\n".join(payload_parts).strip()
-
-        if not payload:
-            payload = (
-                "A previous tool call failed, but no failure text or observations were provided. "
-                "Explain that the agent could not complete the request due to a prior tool error."
-            )
+        _ = observations_text  # kept for future extensions
+        _ = failure_text
 
         return {
-            "goal": f"Respond to the user request using observed failures/observations: {user_input}",
+            "goal": f"Answer the user using available failure/observations without calling tools: {user_input}",
             "steps": [
                 {
-                    "id": "summarize_failure",
-                    "description": "Summarise the failure and observations in a compact form.",
-                    "tool": "summarize_text",
-                    "args": {"text": payload, "bullets": 3},
-                    "requires": [],
-                },
-                {
                     "id": "compose_answer",
-                    "description": "Read all previous step results and produce one coherent answer.",
+                    "description": "Explain what happened using the failure/observations already provided. Do not call tools.",
                     "tool": None,
                     "args": None,
-                    "requires": ["summarize_failure"],
-                },
+                    "requires": [],
+                }
             ],
         }
 
@@ -420,8 +506,12 @@ class Planner:
         return plan
 
     def _prune_non_tool_steps(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Enforce contract: only final compose_answer may be tool=None.
+        Drop any intermediate tool=None steps.
+        """
         steps = plan.get("steps", [])
-        tools = [s for s in steps if s.get("tool") is not None]
+        tool_steps = [s for s in steps if s.get("tool") is not None]
         compose = next((s for s in steps if s.get("id") == "compose_answer"), None)
 
         if compose is None:
@@ -433,25 +523,34 @@ class Planner:
                 "requires": [],
             }
 
-        plan["steps"] = tools + [compose]
+        plan["steps"] = tool_steps + [compose]
         return plan
 
     def _sanitize_requires(self, plan: Dict[str, Any]) -> Dict[str, Any]:
         steps = plan.get("steps", [])
         ids = {s.get("id") for s in steps}
 
-        # Remove requires pointing to non-existent ids
         for s in steps:
             req = s.get("requires", [])
             if not isinstance(req, list):
                 req = [req]
-            s["requires"] = [r for r in req if r in ids]
+
+            s["requires"] = [
+                r
+                for r in req
+                if isinstance(r, str)
+                and r.strip()
+                and r in ids
+            ]
 
         # Force compose_answer to depend on ALL prior tool steps
         compose = next((s for s in steps if s.get("id") == "compose_answer"), None)
         if compose is not None:
-            prior_ids = [s.get("id") for s in steps if s.get("id") != "compose_answer"]
-            compose["requires"] = prior_ids
+            compose["requires"] = [
+                s.get("id")
+                for s in steps
+                if s.get("id") != "compose_answer"
+            ]
 
         return plan
 
