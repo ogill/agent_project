@@ -44,15 +44,10 @@ SEMANTIC_INCLUDE_FAILURE_HITS = False
 # ---------------------------
 
 # Master switch — MUST remain False until MCP is explicitly enabled
-MCP_ENABLED = False
+MCP_ENABLED = True
 
 # MCP servers exposed as tools to the agent
 # Each server is a remote MCP endpoint (HTTP)
 MCP_SERVERS = [
-    # Example (disabled by default):
-    # {
-    #     "alias": "math",
-    #     "endpoint": "http://localhost:8080/mcp",
-    #     "timeout_ms": 5000,
-    # }
+    {"alias": "math", "endpoint": "http://localhost:8080/mcp", "timeout_ms": 5000}
 ]
