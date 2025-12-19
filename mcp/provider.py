@@ -12,15 +12,8 @@ JsonObj = Dict[str, Any]
 
 @dataclass
 class McpProvider:
-    """
-    Thin façade for the rest of the app.
-
-    - Initializes MCP servers (discovery)
-    - Exposes tool specs for planner
-    - Executes MCP tools and normalizes results
-    """
     servers: List[McpHttpServer]
-    registries: Dict[str, McpRegistry]  # keyed by alias
+    registries: Dict[str, McpRegistry]  # alias -> registry
 
     @classmethod
     def from_config(cls, *, enabled: bool, servers_cfg: List[JsonObj]) -> Optional["McpProvider"]:
@@ -34,9 +27,7 @@ class McpProvider:
                 endpoint = str(s["endpoint"])
                 timeout_ms = int(s.get("timeout_ms", 5000))
             except Exception:
-                # Skip invalid config entries
                 continue
-
             servers.append(McpHttpServer(alias=alias, endpoint=endpoint, timeout_ms=timeout_ms))
 
         provider = cls(servers=servers, registries={})
@@ -44,58 +35,40 @@ class McpProvider:
         return provider
 
     def _discover_all(self) -> None:
-        # Discover tools for each server and build registry
-        for s in self.servers:
-            resp = list_tools(s)
-            if resp.get("ok") is True:
-                tools = resp.get("tools", [])
-                if isinstance(tools, list):
-                    self.registries[s.alias] = build_registry(s.alias, tools)
+        for server in self.servers:
+            resp = list_tools(server)
+            tools = resp.get("tools", [])
+            if resp.get("ok") is True and isinstance(tools, list):
+                self.registries[server.alias] = build_registry(
+                    server_alias=server.alias,
+                    tools=tools,
+                    executor_fn=self.execute,
+                )
             else:
-                # If discovery fails, keep server present but with no tools
-                self.registries[s.alias] = McpRegistry(tool_specs=[], routes={})
+                self.registries[server.alias] = McpRegistry(tools_dict={}, routes={})
 
-    def get_tool_specs(self) -> List[JsonObj]:
-        specs: List[JsonObj] = []
+    def get_tools_dict(self) -> Dict[str, JsonObj]:
+        out: Dict[str, JsonObj] = {}
         for reg in self.registries.values():
-            specs.extend(reg.tool_specs)
-        return specs
+            out.update(reg.tools_dict)
+        return out
 
-    def has_tool(self, exposed_tool_name: str) -> bool:
-        return any(reg.has_tool(exposed_tool_name) for reg in self.registries.values())
-
-    def execute(self, exposed_tool_name: str, args: JsonObj) -> JsonObj:
-        """
-        Execute MCP tool by exposed name (mcp.<alias>.<tool>) and return a normalized tool result.
-        This result format is designed to be compatible with existing Stage 6 tool failure handling.
-        """
-        # Find registry that contains this tool
+    def execute(self, exposed_tool_name: str, args: JsonObj) -> Any:
+        # Find matching registry
         for alias, reg in self.registries.items():
             if reg.has_tool(exposed_tool_name):
                 route = reg.resolve(exposed_tool_name)
                 server = self._server_by_alias(alias)
                 if server is None:
-                    return _tool_error(
-                        "MCP_TRANSPORT_ERROR",
-                        f"No MCP server configured for alias '{alias}'",
-                        {"tool": exposed_tool_name, "alias": alias},
-                    )
+                    return _soft_failure("MCP_TRANSPORT_ERROR", "No MCP server for alias", {"alias": alias})
 
                 resp = invoke(server, route.server_tool_name, args)
-
-                # Pass through ok/result or ok/error in a stable envelope
                 if resp.get("ok") is True:
-                    return {"ok": True, "result": resp.get("result")}
-                return {
-                    "ok": False,
-                    "error": resp.get("error", {"type": "MCP_TOOL_ERROR", "message": "Unknown MCP error", "details": {}}),
-                }
+                    # Return tool payload directly (e.g. {"result": 3.0})
+                    return resp.get("result")
+                return _soft_failure("MCP_TOOL_ERROR", "MCP tool call failed", {"error": resp.get("error", {})})
 
-        return _tool_error(
-            "MCP_TOOL_NOT_FOUND",
-            f"Unknown MCP tool: {exposed_tool_name}",
-            {"tool": exposed_tool_name},
-        )
+        return _soft_failure("MCP_TOOL_NOT_FOUND", "Unknown MCP tool", {"tool": exposed_tool_name})
 
     def _server_by_alias(self, alias: str) -> Optional[McpHttpServer]:
         for s in self.servers:
@@ -104,5 +77,11 @@ class McpProvider:
         return None
 
 
-def _tool_error(err_type: str, message: str, details: JsonObj) -> JsonObj:
-    return {"ok": False, "error": {"type": err_type, "message": message, "details": details}}
+def _soft_failure(err_type: str, message: str, details: JsonObj) -> JsonObj:
+    return {
+        "ok": False,
+        "status": "failed",
+        "reason": message,
+        "retryable": False,
+        "details": {"type": err_type, **details},
+    }
