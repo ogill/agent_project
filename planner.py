@@ -235,7 +235,8 @@ class Planner:
             + "\n\nIMPORTANT:\n"
             + "- Do NOT create intermediate non-tool steps (tool=null).\n"
             + "- The ONLY non-tool step allowed is the FINAL 'compose_answer' step.\n"
-            + "- If you need to 'use observations', do it inside compose_answer, not as separate steps.\n\n"
+            + "- If you need to 'use observations', do it inside compose_answer, not as separate steps.\n"
+            + "- Do NOT use JSON references like `$ref` or any symbolic placeholders in tool args; args MUST be concrete JSON values.\n\n"
             + tools_spec
             + "\n\nUser request:\n"
             + user_input
@@ -312,6 +313,11 @@ class Planner:
 
         text = self._sanitize_common_model_json_bugs(text)
 
+        # Stage 7: tool set may include MCP tools injected at runtime.
+        # Build allowed tools dynamically for repair prompts.
+        from tools import TOOLS  # local import avoids circular imports at module import time
+        allowed_tool_names = sorted(TOOLS.keys())
+
         for attempt in range(self.MAX_JSON_REPAIR_ATTEMPTS + 1):
             try:
                 return self._parse_json(
@@ -328,6 +334,7 @@ class Planner:
                 repair_prompt = self._build_json_repair_prompt(
                     bad_output=text,
                     original_prompt=original_prompt,
+                    allowed_tools=allowed_tool_names,  # <-- NEW
                 )
 
                 print("\n" + "=" * 80)
@@ -347,6 +354,24 @@ class Planner:
             "Planner output was not valid JSON after repair attempts. "
             f"Last error: {last_err}\n\nRaw:\n{raw}"
         )
+
+    def _contains_ref(self, obj: Any) -> bool:
+            if isinstance(obj, dict):
+                # explicit $ref key
+                if "$ref" in obj:
+                    return True
+                return any(self._contains_ref(v) for v in obj.values())
+            if isinstance(obj, list):
+                return any(self._contains_ref(v) for v in obj)
+            if isinstance(obj, str):
+                s = obj.lower()
+                # common placeholder patterns
+                if "$ref" in s:
+                    return True
+                if "steps/" in s and "result" in s:
+                    return True
+            return False
+
 
     def _sanitize_common_model_json_bugs(self, s: str) -> str:
         if not s:
@@ -415,9 +440,9 @@ class Planner:
 
         raise ValueError(f"Planner output was not valid JSON:\n{raw}")
 
-    def _build_json_repair_prompt(self, *, bad_output: str, original_prompt: str) -> str:
+    def _build_json_repair_prompt(self, *, bad_output: str, original_prompt: str, allowed_tools: list[str]) -> str:
         bad_as_json_string = json.dumps(bad_output)
-        allowed_tools = ", ".join(sorted(TOOLS.keys()))
+        allowed_tools_str = ", ".join(allowed_tools)
 
         return (
             "You are a JSON repair utility.\n"
@@ -431,12 +456,12 @@ class Planner:
             "Constraints:\n"
             "- FINAL step must be id='compose_answer' with tool=null and args=null.\n"
             "- compose_answer.requires must include every prior step id.\n"
-            f"- tool names must be one of: {allowed_tools}\n\n"
+            f"- tool names must be one of: {allowed_tools_str}\n\n"
+            "- Do NOT use $ref/symbolic placeholders in tool args; args MUST be concrete JSON values.\n\n"
             "The prior model output is provided as an escaped JSON string below.\n"
             "Parse it, fix it, and output ONLY the repaired plan JSON.\n\n"
             f"BAD_OUTPUT_JSON_STRING: {bad_as_json_string}\n"
         )
-
     # --------------------------- normalisation / guardrails ---------------------------
 
     def _normalise_plan_json(
@@ -556,11 +581,32 @@ class Planner:
 
     def _validate_tools(self, plan: Dict[str, Any]) -> None:
         allowed = set(TOOLS.keys())
+
         for s in plan.get("steps", []):
             tool = s.get("tool")
-            if tool and tool not in allowed:
+
+            # Unknown tool name
+            if tool is not None and tool not in allowed:
                 raise ValueError(f"Planner invented unknown tool '{tool}'.")
 
+            # Only validate args for tool steps (compose_answer has tool=None, args=None)
+            if tool is None:
+                continue
+
+            args = s.get("args")
+
+            # Tool args must be a dict (your earlier normalisation already enforces this,
+            # but we keep this defensive).
+            if not isinstance(args, dict):
+                raise ValueError(f"Tool args must be an object for tool '{tool}', got {type(args).__name__}.")
+
+            # Stage 7: disallow JSON references / placeholders inside tool args.
+            # We do not support cross-step variable references in args.
+            if self._contains_ref(args):
+                raise ValueError(
+                    "Planner used $ref/symbolic placeholder in tool args; args must be concrete JSON values."
+                )
+    
     def _enforce_forbidden_tools(self, plan: Dict[str, Any], *, forbidden_tools: Set[str]) -> None:
         if not forbidden_tools:
             return
