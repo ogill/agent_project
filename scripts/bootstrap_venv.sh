@@ -68,3 +68,5 @@ echo "👉 Run tests with: pytest -q"
 echo "👉 Run app with: python main.py"
 
 ollama pull nomic-embed-text      
+pip install fastapi uvicorn
+uvicorn mcp_server_math.server:app --port 8080
