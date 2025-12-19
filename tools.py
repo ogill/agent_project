@@ -17,6 +17,9 @@ from schemas import (
 )
 from pydantic import BaseModel, Field
 
+#MCP Integration
+from config import MCP_ENABLED, MCP_SERVERS
+from mcp.provider import McpProvider
 
 def _fetch_url(url: str) -> str:
     """
@@ -113,3 +116,9 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "fn": lambda **kwargs: summarize_text(**SummarizeTextArgs(**kwargs).model_dump()),
     },
 }
+
+# --- MCP tools (Stage 7) ---
+if MCP_ENABLED:
+    _mcp_provider = McpProvider.from_config(enabled=True, servers_cfg=MCP_SERVERS)
+    if _mcp_provider is not None:
+        TOOLS.update(_mcp_provider.get_tools_dict())
