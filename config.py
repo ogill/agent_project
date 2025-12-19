@@ -38,3 +38,21 @@ EMBEDDINGS_MODEL = "nomic-embed-text"
 
 SEMANTIC_DEBUG = False
 SEMANTIC_INCLUDE_FAILURE_HITS = False
+
+# ---------------------------
+# MCP integration (Stage 7)
+# ---------------------------
+
+# Master switch — MUST remain False until MCP is explicitly enabled
+MCP_ENABLED = False
+
+# MCP servers exposed as tools to the agent
+# Each server is a remote MCP endpoint (HTTP)
+MCP_SERVERS = [
+    # Example (disabled by default):
+    # {
+    #     "alias": "math",
+    #     "endpoint": "http://localhost:8080/mcp",
+    #     "timeout_ms": 5000,
+    # }
+]
