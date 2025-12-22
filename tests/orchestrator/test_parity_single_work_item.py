@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from agent import Agent
 from orchestrator.orchestrator import Orchestrator
+from orchestrator.roles import RoleRegistry, RoleSpec
 
 
 class _FakeAgent:
@@ -15,10 +16,10 @@ class _FakeAgent:
 def test_parity_single_work_item_pass_through_is_exact():
     # Deterministic parity guarantee: orchestrator must return agent output unchanged
     agent = _FakeAgent("OK")
-    orch = Orchestrator(agent_registry={"generalist": agent})
+    roles = RoleRegistry({"generalist": RoleSpec(name="generalist", agent=agent)})
+    orch = Orchestrator(role_registry=roles)
 
     out = orch.run("Return exactly the string: OK")
-
     assert out == "OK"
 
 
@@ -27,7 +28,8 @@ def test_single_work_item_real_agent_smoke_contract():
     user_input = "Return exactly the string: OK"
 
     agent = Agent()
-    orch = Orchestrator(agent_registry={"generalist": agent})
+    roles = RoleRegistry({"generalist": RoleSpec(name="generalist", agent=agent)})
+    orch = Orchestrator(role_registry=roles)
 
     out = orch.run(user_input)
 
