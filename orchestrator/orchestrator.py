@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
-
 from orchestrator.models import WorkItem
 from orchestrator.roles import RoleRegistry
+from orchestrator.routing import build_work_items_for_template
 
 
 @dataclass
@@ -57,6 +57,16 @@ class Orchestrator:
 
         return _merge_results_deterministically(work_items, results)
 
+    def run_template(self, template: str, goal: str, context: Optional[Dict[str, Any]] = None) -> str:
+            """
+            Stage 8.2.3: deterministic multi-role routing via templates.
+            """
+            context = context or {}
+            work_items = build_work_items_for_template(template=template, goal=goal, context=context)
+            return self.run_work_items(work_items)
+
+
+
 
 def _compose_user_input(goal: str, context: Dict[str, Any]) -> str:
     if not context:
@@ -82,3 +92,4 @@ def _merge_results_deterministically(work_items: List[WorkItem], results: Dict[s
         lines.append(results.get(wi.id, "").rstrip())
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
