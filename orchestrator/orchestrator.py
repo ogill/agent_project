@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 from orchestrator.models import WorkItem
 from orchestrator.roles import RoleRegistry
 from orchestrator.routing import build_work_items_for_template
-
+from orchestrator.context import RunContext, Artifact
 
 @dataclass
 class OrchestratorPolicy:
@@ -42,6 +42,7 @@ class Orchestrator:
         return self.run_work_items([work_item])
 
     def run_work_items(self, work_items: List[WorkItem]) -> str:
+        run_context = RunContext()
         if len(work_items) > self.policy.max_work_items:
             raise ValueError(
                 f"Too many WorkItems: {len(work_items)} (max {self.policy.max_work_items})"
@@ -51,8 +52,19 @@ class Orchestrator:
 
         for wi in work_items:
             agent = self.role_registry.get_agent(wi.assigned_agent)
-            user_input = _compose_user_input(wi.goal, wi.inputs)
+            user_input = _compose_user_input(wi.goal, wi.inputs, run_context)
             output = _run_stage7_agent(agent, user_input)
+
+            artifact = Artifact(
+                key=f"{wi.id}.output",
+                value=output,
+                producer=wi.id,
+                metadata={
+                    "role": wi.assigned_agent,
+                },
+            )
+
+            run_context.add_artifact(artifact)
             results[wi.id] = output
 
         return _merge_results_deterministically(work_items, results)
@@ -68,10 +80,19 @@ class Orchestrator:
 
 
 
-def _compose_user_input(goal: str, context: Dict[str, Any]) -> str:
-    if not context:
-        return goal
-    return f"{goal}\n\nContext (JSON): {context}"
+def _compose_user_input(goal: str, context: Dict[str, Any], run_context: RunContext) -> str:
+    parts = [goal]
+
+    if context:
+        parts.append(f"Initial context (JSON): {context}")
+
+    if run_context.artifacts:
+        parts.append(
+            "Shared context artifacts:\n"
+            f"{run_context.snapshot()}"
+        )
+
+    return "\n\n".join(parts)
 
 
 def _run_stage7_agent(agent: Any, user_input: str) -> str:
