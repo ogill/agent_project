@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from agent import Agent
 from orchestrator.models import WorkItem
-from orchestrator.orchestrator import Orchestrator
+from orchestrator.orchestrator import Orchestrator, OrchestratorPolicy
 from orchestrator.roles import RoleRegistry, RoleSpec
 
 
@@ -13,7 +13,7 @@ def test_multi_work_item_sequential_merge_contains_all_outputs():
             "generalist": RoleSpec(name="generalist", agent=agent),
         }
     )
-    orch = Orchestrator(role_registry=roles)
+    orch = Orchestrator(role_registry=roles, policy=OrchestratorPolicy(enable_parallel=False))
 
     work_items = [
         WorkItem(
