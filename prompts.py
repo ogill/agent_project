@@ -65,6 +65,7 @@ def get_planner_prompt(mode: str = "strict") -> str:
         "- For such requests, output a plan with ONLY ONE step: compose_answer.\n"
         "- You MUST NOT invent actions like fetching URLs, checking websites, or using tools to \"ask the user\".\n"
         "- You MUST NOT call summarize_text for memory recall; compose_answer is sufficient.\n\n"
+        "- If the user asks for analysis, evaluation, or opinion without providing source text, the plan MUST contain only compose_answer.\".\n"
         "TOOL USAGE RULES:\n"
         "- Only call fetch_url if the user explicitly asks to fetch a URL, read a webpage, or retrieve online content.\n"
         "- Only call get_time/get_weather if the user explicitly asks for time/weather.\n"

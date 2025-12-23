@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Set
 
 from planner import Planner
@@ -31,8 +32,6 @@ class Agent:
         failure_text = ""
         last_failure_text = ""  # tracks latest failure in THIS run
 
-        # Track retryability decisions for soft failures so the except-block
-        # doesn’t incorrectly mark retryable tools as "do not retry".
         soft_failure_retryable: Dict[str, bool] = {}
 
         def _is_soft_failure(result: Any) -> bool:
@@ -64,10 +63,14 @@ class Agent:
 
         for attempt in range(self.max_replans + 1):
             try:
+                tools_ran = False
+
                 # Execute tool steps
                 for step in plan.steps:
                     if not step.tool:
                         continue
+
+                    tools_ran = True
 
                     if step.tool in failed_tools:
                         raise RuntimeError(
@@ -82,26 +85,30 @@ class Agent:
                         reason = _soft_failure_reason(result)
                         retryable = _retryable(result)
 
-                        # Record retryability for the except-block
                         soft_failure_retryable[step.tool] = retryable
 
-                        # Only forbid if NOT retryable
                         if not retryable:
                             failed_tools.add(step.tool)
 
-                        # Trigger replanning via exception path
                         raise RuntimeError(f"Tool '{step.tool}' soft failed: {reason}")
+
+                # If NO tools ran, do NOT ask the LLM to "interpret missing observations".
+                # First, handle "exact output" style requests deterministically.
+                if not tools_ran:
+                    exact = self._extract_exact_output_request(user_input)
+                    if exact is not None:
+                        self.memory.append(user_input, exact)
+                        return exact
 
                 # Compose final answer (do NOT trigger replanning if this fails)
                 try:
-                    # If we had any tool failures earlier in THIS run, pass the latest failure text
-                    # so the model explains the real cause instead of guessing from memory.
                     compose_failure_text = last_failure_text if failed_tools else ""
                     final_answer = self._compose_answer(
                         user_input=user_input,
                         observations=observations,
                         failed_tools=failed_tools,
                         failure_text=compose_failure_text,
+                        tools_ran=tools_ran,
                     )
                 except Exception as e:
                     observations_text = self._format_observations(observations, failed_tools)
@@ -116,7 +123,6 @@ class Agent:
                 failure_text = str(e)
                 last_failure_text = failure_text
 
-                # Extract tool name from hard or soft failure strings
                 tool_name = None
                 msg = failure_text
                 hard_fail = False
@@ -129,9 +135,6 @@ class Agent:
                     tool_name = msg.split("Tool '", 1)[1].split("'", 1)[0]
                     soft_fail = True
 
-                # IMPORTANT:
-                # - hard failures always forbid
-                # - soft failures only forbid if tool was recorded as NOT retryable
                 if tool_name:
                     if hard_fail:
                         failed_tools.add(tool_name)
@@ -147,7 +150,7 @@ class Agent:
                     self.memory.append(user_input, final_answer)
                     return final_answer
 
-                # Replan (pass forbidden tools if supported)
+                # Replan
                 try:
                     plan = self.planner.generate_plan(
                         user_input=user_input,
@@ -186,6 +189,28 @@ class Agent:
         except Exception as e:
             raise RuntimeError(f"Tool '{step.tool}' failed: {e}") from e
 
+    def _extract_exact_output_request(self, user_input: str) -> str | None:
+        """
+        Deterministic helper for prompts like:
+          - "Return exactly the string: OK"
+          - "Output exactly: OK"
+          - "Do not use any tools. Output exactly: OK"
+        Returns the requested literal (e.g. "OK") or None if not matched.
+        """
+        s = (user_input or "").strip()
+
+        # Return exactly the string: X
+        m = re.search(r"(?i)\breturn exactly the string:\s*(.+)\s*$", s)
+        if m:
+            return m.group(1).strip().strip('"').strip("'")
+
+        # Output exactly: X
+        m = re.search(r"(?i)\boutput exactly:\s*(.+)\s*$", s)
+        if m:
+            return m.group(1).strip().strip('"').strip("'")
+
+        return None
+
     def _compose_answer(
         self,
         *,
@@ -193,16 +218,16 @@ class Agent:
         observations: Dict[str, Any],
         failed_tools: Set[str] | None = None,
         failure_text: str = "",
+        tools_ran: bool = False,
     ) -> str:
         from llm_client import call_llm
 
         failed_tools = failed_tools or set()
-        obs_text = self._format_observations(observations, failed_tools)
 
         prompt_parts: List[str] = []
 
-        # Key rule: if there was a failure in THIS run, do NOT inject memory.
-        # It causes exactly the bug you saw (model "borrows" an old failure cause like 404).
+        # Only inject episodic memory when there was no failure in this run
+        # AND the run wasn't a tool-driven failure scenario.
         if not failed_tools and not failure_text.strip():
             memory_context = self.memory.build_context(user_input)
             if memory_context:
@@ -215,10 +240,13 @@ class Agent:
 
         prompt_parts.append("User request:\n" + user_input)
 
-        prompt_parts.append(
-            "Observations (ground truth from tools in THIS run):\n"
-            + (obs_text if obs_text.strip() else "(none)")
-        )
+        # IMPORTANT: Only mention tools/observations if tools actually ran OR a tool failed.
+        if tools_ran or failed_tools or failure_text.strip():
+            obs_text = self._format_observations(observations, failed_tools)
+            prompt_parts.append(
+                "Observations (ground truth from tools in THIS run):\n"
+                + (obs_text if obs_text.strip() else "(none)")
+            )
 
         if failure_text.strip():
             prompt_parts.append(
@@ -226,13 +254,23 @@ class Agent:
                 + failure_text.strip()
             )
 
-        prompt_parts.append(
-            "Write a clear, user-facing response.\n"
-            "- If any tool failed, you MUST explicitly say: 'The tool <tool_name> failed' (use the word 'failed').\n"
-            "- Explain the failure cause ONLY using the Failure text above and/or the Observations above.\n"
-            "- Do NOT invent HTTP status codes or error causes that are not explicitly present.\n"
-            "- Do NOT mention unrelated past failures or prior conversations unless the user explicitly asks."
-        )
+        # If this was a no-tool run, be explicit: answer directly; do not invent tools.
+        if not tools_ran and not failed_tools and not failure_text.strip():
+            prompt_parts.append(
+                "Instructions:\n"
+                "- No tools were run for this request.\n"
+                "- Answer the user directly from the request.\n"
+                "- Do NOT mention tools, observations, or failures.\n"
+                "- If the user asked for an exact literal output, output exactly that."
+            )
+        else:
+            prompt_parts.append(
+                "Write a clear, user-facing response.\n"
+                "- If any tool failed, you MUST explicitly say: 'The tool <tool_name> failed' (use the word 'failed').\n"
+                "- Explain the failure cause ONLY using the Failure text above and/or the Observations above.\n"
+                "- Do NOT invent HTTP status codes or error causes that are not explicitly present.\n"
+                "- Do NOT mention unrelated past failures or prior conversations unless the user explicitly asks."
+            )
 
         prompt = "\n\n".join(prompt_parts)
         return call_llm(prompt)
