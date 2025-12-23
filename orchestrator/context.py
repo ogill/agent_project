@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Iterable
 
 
 @dataclass(frozen=True)
@@ -40,3 +40,13 @@ class RunContext:
             }
             for k, a in self.artifacts.items()
         }
+    def snapshot_selected(self, keys: Iterable[str]) -> Dict[str, Any]:
+        keys = list(keys)
+        missing = [k for k in keys if k not in self.artifacts]
+        if missing:
+            raise KeyError(f"Missing required artifacts: {missing}")
+        return {k: {
+            "value": self.artifacts[k].value,
+            "producer": self.artifacts[k].producer,
+            "metadata": self.artifacts[k].metadata,
+        } for k in keys}

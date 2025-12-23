@@ -22,18 +22,21 @@ def build_work_items_for_template(template: str, goal: str, context: Dict[str, A
                 assigned_agent=RESEARCHER,
                 goal=f"Extract key requirements and constraints from: {goal}",
                 inputs=context,
+                depends_on=[],
             ),
             WorkItem(
                 id="task-002",
                 assigned_agent=GENERALIST,
                 goal=f"Propose an implementation approach for: {goal}",
                 inputs=context,
+                depends_on=["task-001.output"],
             ),
             WorkItem(
                 id="task-003",
                 assigned_agent=REVIEWER,
                 goal=f"Review the proposed approach for risks, gaps, and a minimal test plan for: {goal}",
                 inputs=context,
+                depends_on=["task-001.output", "task-002.output"],
             ),
         ]
 

@@ -11,9 +11,12 @@ class FakeAgent:
         self.name = name
 
     def run(self, user_input: str) -> str:
-        if "Shared context artifacts" in user_input:
-            return f"{self.name} saw context"
-        return f"{self.name} initial"
+        if "Shared context artifacts" not in user_input:
+            return f"{self.name} initial"
+
+        saw_w1 = "w1.output" in user_input
+        saw_w2 = "w2.output" in user_input
+        return f"saw_w1={saw_w1} saw_w2={saw_w2}"
 
 
 def test_downstream_work_item_sees_upstream_artifact():
@@ -26,12 +29,10 @@ def test_downstream_work_item_sees_upstream_artifact():
     )
 
     work_items = [
-        WorkItem(id="w1", assigned_agent="generalist", goal="Step one", inputs={}),
-        WorkItem(id="w2", assigned_agent="generalist", goal="Step two", inputs={}),
+        WorkItem(id="w1", assigned_agent="generalist", goal="Step one", inputs={}, depends_on=[]),
+        WorkItem(id="w2", assigned_agent="generalist", goal="Step two", inputs={}, depends_on=["w1.output"]),
     ]
-
     out = orch.run_work_items(work_items)
 
-    assert "w1" in out
-    assert "w2" in out
-    assert "saw context" in out
+    assert "saw_w1=True" in out
+    assert "saw_w2=False" in out

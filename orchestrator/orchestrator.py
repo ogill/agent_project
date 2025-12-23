@@ -52,7 +52,13 @@ class Orchestrator:
 
         for wi in work_items:
             agent = self.role_registry.get_agent(wi.assigned_agent)
-            user_input = _compose_user_input(wi.goal, wi.inputs, run_context)
+
+            # Only inject what this WorkItem explicitly depends on
+            selected = {}
+            if wi.depends_on:
+                selected = run_context.snapshot_selected(wi.depends_on)
+
+            user_input = _compose_user_input(wi.goal, wi.inputs, selected)
             output = _run_stage7_agent(agent, user_input)
 
             artifact = Artifact(
@@ -80,19 +86,20 @@ class Orchestrator:
 
 
 
-def _compose_user_input(goal: str, context: Dict[str, Any], run_context: RunContext) -> str:
-    parts = [goal]
+def _compose_user_input(
+        goal: str,
+        context: Dict[str, Any],
+        selected_artifacts: Dict[str, Any],
+    ) -> str:
+        parts = [goal]
 
-    if context:
-        parts.append(f"Initial context (JSON): {context}")
+        if context:
+            parts.append(f"Initial context (JSON): {context}")
 
-    if run_context.artifacts:
-        parts.append(
-            "Shared context artifacts:\n"
-            f"{run_context.snapshot()}"
-        )
+        if selected_artifacts:
+            parts.append("Shared context artifacts:\n" + f"{selected_artifacts}")
 
-    return "\n\n".join(parts)
+        return "\n\n".join(parts)
 
 
 def _run_stage7_agent(agent: Any, user_input: str) -> str:
