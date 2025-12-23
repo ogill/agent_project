@@ -36,17 +36,44 @@ class McpProvider:
 
     def _discover_all(self) -> None:
         for server in self.servers:
-            resp = list_tools(server)
+            # Default to an empty registry for this alias
+            self.registries[server.alias] = McpRegistry(tools_dict={}, routes={})
+
+            try:
+                resp = list_tools(server)
+            except Exception as e:
+                # Keep the empty registry, but preserve a hint for debugging
+                try:
+                    self.registries[server.alias].routes["_discover_error"] = {
+                        "alias": server.alias,
+                        "endpoint": getattr(server, "endpoint", None),
+                        "error": repr(e),
+                    }
+                except Exception:
+                    pass
+                continue
+
             tools = resp.get("tools", [])
-            if resp.get("ok") is True and isinstance(tools, list):
+
+            if resp.get("ok") is True and isinstance(tools, list) and tools:
                 self.registries[server.alias] = build_registry(
                     server_alias=server.alias,
                     tools=tools,
                     executor_fn=self.execute,
                 )
             else:
-                self.registries[server.alias] = McpRegistry(tools_dict={}, routes={})
-
+                # Keep empty registry; optionally store the response for debugging
+                try:
+                    self.registries[server.alias].routes["_discover_response"] = {
+                        "alias": server.alias,
+                        "endpoint": getattr(server, "endpoint", None),
+                        "ok": resp.get("ok"),
+                        "error": resp.get("error"),
+                        "tools_type": type(tools).__name__,
+                    }
+                except Exception:
+                    pass
+                
     def get_tools_dict(self) -> Dict[str, JsonObj]:
         out: Dict[str, JsonObj] = {}
         for reg in self.registries.values():

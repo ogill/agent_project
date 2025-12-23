@@ -4,22 +4,19 @@ from __future__ import annotations
 
 import datetime
 import urllib.request
-import urllib.error
 from typing import Any, Dict
 
-from llm_client import call_llm
-from schemas import (
-    AlwaysFailArgs,
-    GetTimeArgs,
-    GetWeatherArgs,
-    FetchUrlArgs,
-    SummarizeTextArgs,
-)
 from pydantic import BaseModel, Field
 
-#MCP Integration
 from config import MCP_ENABLED, MCP_SERVERS
 from mcp.provider import McpProvider
+from schemas import (
+    AlwaysFailArgs,
+    FetchUrlArgs,
+    GetTimeArgs,
+    GetWeatherArgs,
+)
+
 
 def _fetch_url(url: str) -> str:
     """
@@ -67,18 +64,7 @@ def fetch_url(url: str) -> str:
     return _fetch_url(url)
 
 
-def summarize_text(text: str, bullets: int = 3) -> str:
-    prompt = (
-        "Summarise the following text into concise bullet points.\n"
-        f"Return exactly {bullets} bullet points.\n\n"
-        "TEXT:\n"
-        f"{text}\n"
-    )
-    return call_llm(prompt)
-
-
 # --- Inline schema for soft_fail (keeps change isolated; no need to edit schemas.py yet) ---
-
 class SoftFailArgs(BaseModel):
     reason: str = Field(default="soft failure for replanning test")
     retryable: bool = Field(default=False)
@@ -109,11 +95,6 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "description": "Fetch raw content from a given URL (HTML/text, truncated). (Hard-fail on errors)",
         "args_model": FetchUrlArgs,
         "fn": lambda **kwargs: fetch_url(**FetchUrlArgs(**kwargs).model_dump()),
-    },
-    "summarize_text": {
-        "description": "Summarise arbitrary text into bullet points using the LLM.",
-        "args_model": SummarizeTextArgs,
-        "fn": lambda **kwargs: summarize_text(**SummarizeTextArgs(**kwargs).model_dump()),
     },
 }
 

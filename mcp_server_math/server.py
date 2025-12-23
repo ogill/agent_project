@@ -74,6 +74,9 @@ def list_tools() -> ToolsResponse:
         ]
     )
 
+@app.get("/mcp")
+def mcp_root():
+    return {"ok": True, "service": "mcp"}
 
 @app.post("/mcp/invoke", response_model=InvokeOk | InvokeErr)
 def invoke(req: InvokeRequest):

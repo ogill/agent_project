@@ -1,3 +1,5 @@
+# orchestrator/orchestrator.py
+
 from __future__ import annotations
 
 import asyncio
@@ -16,18 +18,14 @@ class OrchestratorPolicy:
     max_concurrency: int = 4
     per_item_timeout_s: float = 15.0
     enable_parallel: bool = True
+    trace: bool = True  # <-- NEW: simple orchestrator tracing
 
 
 class Orchestrator:
     """
     Stage 8 Orchestrator:
-    - 8.2: single WorkItem -> single agent call (parity path)
-    - 8.2.1: multiple WorkItems -> sequential agent calls + deterministic merge
-    - 8.2.2: role indirection via RoleRegistry (no behavior change)
-    - 8.2.3: deterministic routing templates -> multi-role WorkItems
-    - 8.3.1: RunContext + structured artifacts
-    - 8.3.2: explicit dependencies (depends_on) + selective artifact injection
-    - 8.4: parallel execution in dependency-safe "waves" (bounded concurrency + timeouts)
+    - runs one or more WorkItems (each WorkItem = one Agent.run call)
+    - supports deterministic templates + explicit deps + parallel waves
     """
 
     def __init__(
@@ -47,17 +45,31 @@ class Orchestrator:
             goal=goal,
             inputs=context,
             expected_output={},
+            depends_on=[],
         )
-
         return self.run_work_items([work_item])
 
     def run_template(self, template: str, goal: str, context: Optional[Dict[str, Any]] = None) -> str:
-        """
-        Stage 8.2.3: deterministic multi-role routing via templates.
-        """
         context = context or {}
         work_items = build_work_items_for_template(template=template, goal=goal, context=context)
         return self.run_work_items(work_items)
+
+    def describe_template(self, template: str, goal: str, context: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Human-friendly explanation of what will run (for demos/stakeholders).
+        This is NOT an LLM call.
+        """
+        context = context or {}
+        work_items = build_work_items_for_template(template=template, goal=goal, context=context)
+
+        lines: List[str] = []
+        lines.append("Orchestrator plan:")
+        lines.append(f"- Template: {template}")
+        lines.append(f"- WorkItems: {len(work_items)}")
+        for wi in work_items:
+            deps = getattr(wi, "depends_on", []) or []
+            lines.append(f"  - {wi.id}: role={wi.assigned_agent} deps={deps}")
+        return "\n".join(lines)
 
     def run_work_items(self, work_items: List[WorkItem]) -> str:
         if len(work_items) > self.policy.max_work_items:
@@ -68,7 +80,6 @@ class Orchestrator:
         run_context = RunContext()
         results: Dict[str, str] = {}
 
-        # Execute WorkItems in dependency-safe "waves"
         remaining = list(work_items)
 
         while remaining:
@@ -82,28 +93,35 @@ class Orchestrator:
                     if missing:
                         missing_detail[wi.id] = missing
 
-                # Preserve 8.3.2 semantics: missing deps are a KeyError
                 if missing_detail:
                     raise KeyError(f"Missing required artifacts: {missing_detail}")
 
-                # Otherwise, it's a cycle (deps exist but cannot be satisfied due to ordering)
                 raise RuntimeError("No runnable WorkItems found. Possible dependency cycle.")
 
-            # If only one item is ready, or parallel disabled: run sequentially
+            if self.policy.trace:
+                print(f"[ORCH] wave: {[wi.id for wi in ready]}")
+
             if (not self.policy.enable_parallel) or (len(ready) == 1):
                 wi = ready[0]
+                if self.policy.trace:
+                    print(
+                        f"[ORCH] run: {wi.id} role={wi.assigned_agent} deps={getattr(wi,'depends_on',[]) or []}"
+                    )
                 out = _run_one_sync(wi, self.role_registry, run_context)
                 _record_output(wi, out, run_context, results)
             else:
-                # Run a wave in parallel
+                if self.policy.trace:
+                    for wi in ready:
+                        print(
+                            f"[ORCH] run(par): {wi.id} role={wi.assigned_agent} deps={getattr(wi,'depends_on',[]) or []}"
+                        )
+
                 outs = _run_wave_parallel(ready, self.role_registry, run_context, self.policy)
 
-                # Record outputs in deterministic order (the order they appear in `ready`)
                 for wi in ready:
                     out = outs[wi.id]
                     _record_output(wi, out, run_context, results)
 
-            # Remove completed items
             done_ids = {wi.id for wi in ready}
             remaining = [wi for wi in remaining if wi.id not in done_ids]
 
@@ -129,9 +147,6 @@ def _run_stage7_agent(agent: Any, user_input: str) -> str:
 
 
 def _select_ready_work_items(remaining: List[WorkItem], run_context: RunContext) -> List[WorkItem]:
-    """
-    A WorkItem is ready if all its depends_on keys exist in run_context.artifacts.
-    """
     ready: List[WorkItem] = []
     for wi in remaining:
         deps = getattr(wi, "depends_on", []) or []
@@ -142,10 +157,9 @@ def _select_ready_work_items(remaining: List[WorkItem], run_context: RunContext)
 
 def _run_one_sync(wi: WorkItem, role_registry: RoleRegistry, run_context: RunContext) -> str:
     agent = role_registry.get_agent(wi.assigned_agent)
-
+    print(f"[ORCH] call: {wi.id} agent={wi.assigned_agent}")
     selected: Dict[str, Any] = {}
     if getattr(wi, "depends_on", None):
-        # Raises KeyError if missing deps -> good, fail fast
         selected = run_context.snapshot_selected(wi.depends_on)
 
     user_input = _compose_user_input(wi.goal, wi.inputs, selected)
@@ -181,10 +195,6 @@ def _run_wave_parallel(
     run_context: RunContext,
     policy: OrchestratorPolicy,
 ) -> Dict[str, str]:
-    """
-    Runs a wave concurrently with bounded concurrency + per-item timeout.
-    Returns {work_item_id: output}.
-    """
     async def _runner() -> Dict[str, str]:
         sem = asyncio.Semaphore(policy.max_concurrency)
         tasks = [
@@ -209,7 +219,6 @@ def _record_output(wi: WorkItem, output: str, run_context: RunContext, results: 
 
 
 def _merge_results_deterministically(work_items: List[WorkItem], results: Dict[str, str]) -> str:
-    # Stage 7 parity guarantee for single WorkItem:
     if len(work_items) == 1:
         wi = work_items[0]
         return results.get(wi.id, "")

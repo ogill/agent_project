@@ -36,17 +36,61 @@ class Planner:
     """
     Planner: ask the LLM to produce a structured Plan (JSON).
 
-    Hardening:
-    - Deterministic sanitisation for common "almost JSON" bugs
-    - JSON repair prompt (embeds bad output as escaped JSON string)
-    - Normalises steps (id/description/tool/args/requires)
-    - Coerces UNKNOWN tools to tool=None (never raises for invented tool names)
-    - Enforces compose_answer final step and dependencies
-    - Enforces "no intermediate tool=None steps" by pruning them
-    - Replanning can forbid tools; fallback for replan violations
+    Trace levels:
+      - off: no planner prints
+      - summary: prints plan summary only
+      - debug: prints full prompt + raw response + repair prompts + plan summary
     """
 
     MAX_JSON_REPAIR_ATTEMPTS = 2
+
+    def __init__(self) -> None:
+        self._trace_level = "debug"  # main.py can set to off/summary/debug
+
+    # --------------------------- trace control ---------------------------
+
+    def set_trace_level(self, level: str) -> None:
+        level = (level or "").lower().strip()
+        if level not in {"off", "summary", "debug"}:
+            raise ValueError("trace level must be one of: off, summary, debug")
+        self._trace_level = level
+
+    def get_trace_level(self) -> str:
+        return getattr(self, "_trace_level", "debug")
+
+    def _trace_enabled(self, level: str) -> bool:
+        order = {"off": 0, "summary": 1, "debug": 2}
+        cur = order.get(self.get_trace_level(), 2)
+        req = order.get(level, 1)
+        return cur >= req
+
+    # --------------------------- presentation helpers ---------------------------
+
+    def print_plan_summary(self, plan: Plan) -> None:
+        """Explicit summary printer used by :plan. Prints regardless of trace."""
+        print("[PLANNER] Plan summary:")
+        print(f"  Goal: {plan.goal}")
+        for s in plan.steps:
+            print(f"    - {s.id} | tool={s.tool} | requires={s.requires}")
+        print()
+
+    def explain_plan(self, plan: Plan) -> str:
+        lines: list[str] = []
+        lines.append("Explain plan:")
+        lines.append(f"- Goal: {plan.goal}")
+
+        tool_steps = [s for s in plan.steps if s.id != "compose_answer" and s.tool]
+        lines.append("- What will happen:")
+        if tool_steps:
+            for i, s in enumerate(tool_steps, 1):
+                lines.append(f"  {i}) {s.description} (tool: {s.tool})")
+            lines.append("- Then: compose the final answer from the observations produced by those tool calls.")
+        else:
+            lines.append("  1) Answer directly from the user request (no tools will be executed).")
+
+        return "\n".join(lines)
+
+    # --------------------------- main entrypoint ---------------------------
 
     def generate_plan(
         self,
@@ -108,17 +152,19 @@ class Planner:
             forbidden_tools=forbidden_tools,
         )
 
-        print("\n" + "=" * 80)
-        print("[PLANNER DEBUG] FULL PROMPT SENT TO LLM:\n " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        print(prompt)
-        print("=" * 80 + "\n")
+        if self._trace_enabled("debug"):
+            print("\n" + "=" * 80)
+            print("[PLANNER DEBUG] FULL PROMPT SENT TO LLM:\n " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            print(prompt)
+            print("=" * 80 + "\n")
 
         raw = call_llm(prompt)
 
-        print("\n" + "=" * 80)
-        print("[PLANNER DEBUG] RAW RESPONSE FROM LLM:\n " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        print(raw)
-        print("=" * 80 + "\n")
+        if self._trace_enabled("debug"):
+            print("\n" + "=" * 80)
+            print("[PLANNER DEBUG] RAW RESPONSE FROM LLM:\n " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            print(raw)
+            print("=" * 80 + "\n")
 
         plan_json = self._parse_or_repair_json(
             raw,
@@ -133,7 +179,8 @@ class Planner:
             self._enforce_forbidden_tools(plan_json, forbidden_tools=forbidden_tools)
         except Exception as e:
             if is_replan:
-                print(f"[PLANNER DEBUG] Model replan violated forbidden tools, falling back. Reason: {e}")
+                if self._trace_enabled("debug"):
+                    print(f"[PLANNER DEBUG] Model replan violated forbidden tools, falling back. Reason: {e}")
                 plan_json = self._deterministic_replan_plan(
                     user_input=user_input,
                     observations_text=observations_text,
@@ -322,18 +369,20 @@ class Planner:
                     allowed_tools=allowed_tool_names,
                 )
 
-                print("\n" + "=" * 80)
-                print(f"[PLANNER DEBUG] JSON REPAIR ATTEMPT {attempt+1} PROMPT SENT TO LLM:\n")
-                print(repair_prompt)
-                print("=" * 80 + "\n")
+                if self._trace_enabled("debug"):
+                    print("\n" + "=" * 80)
+                    print(f"[PLANNER DEBUG] JSON REPAIR ATTEMPT {attempt+1} PROMPT SENT TO LLM:\n")
+                    print(repair_prompt)
+                    print("=" * 80 + "\n")
 
                 text = call_llm(repair_prompt)
                 text = self._sanitize_common_model_json_bugs(text)
 
-                print("\n" + "=" * 80)
-                print(f"[PLANNER DEBUG] JSON REPAIR ATTEMPT {attempt+1} RAW RESPONSE FROM LLM:\n")
-                print(text)
-                print("=" * 80 + "\n")
+                if self._trace_enabled("debug"):
+                    print("\n" + "=" * 80)
+                    print(f"[PLANNER DEBUG] JSON REPAIR ATTEMPT {attempt+1} RAW RESPONSE FROM LLM:\n")
+                    print(text)
+                    print("=" * 80 + "\n")
 
         raise ValueError(
             "Planner output was not valid JSON after repair attempts. "
@@ -385,11 +434,11 @@ class Planner:
             first = text.find("```")
             last = text.rfind("```")
             if first != -1 and last != -1 and last > first:
-                inner = text[first + 3 : last].lstrip()
+                inner = text[first + 3: last].lstrip()
                 if inner.lower().startswith("json"):
                     nl = inner.find("\n")
                     if nl != -1:
-                        inner = inner[nl + 1 :]
+                        inner = inner[nl + 1:]
                 text = inner.strip()
 
         # parse
@@ -408,7 +457,7 @@ class Planner:
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
-            candidate = text[start : end + 1]
+            candidate = text[start: end + 1]
             candidate = self._sanitize_common_model_json_bugs(candidate)
             data = json.loads(candidate)
             return self._normalise_plan_json(
@@ -464,11 +513,11 @@ class Planner:
         plan: Dict[str, Any] = data
 
         plan = self._ensure_step_fields(plan)
-        plan = self._coerce_unknown_tools_to_none(plan)   # <-- KEY FIX (no raise)
+        plan = self._coerce_unknown_tools_to_none(plan)          # no raise
         plan = self._ensure_compose_answer(plan)
-        plan = self._prune_intermediate_non_tool_steps(plan)  # <-- KEY FIX (prune)
+        plan = self._prune_intermediate_non_tool_steps(plan)     # prunes tool=None steps (except coerced unknown)
         plan = self._sanitize_requires(plan)
-        self._validate_tools(plan)  # validates only remaining tool steps
+        self._validate_tools(plan)
 
         return plan
 
@@ -481,16 +530,13 @@ class Planner:
             tool = s.get("tool", None)
             args = s.get("args", None)
 
-            # Normalise requires
             req = s.get("requires", [])
             if not isinstance(req, list):
                 req = [req]
 
-            # If tool is None => args must be None
             if tool is None:
                 args = None
             else:
-                # tool step => args must be dict
                 if not isinstance(args, dict):
                     args = {}
 
@@ -508,11 +554,6 @@ class Planner:
         return plan
 
     def _coerce_unknown_tools_to_none(self, plan: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        If the LLM invents a tool, do NOT raise.
-        Coerce that step to tool=None and args=None, but keep the step (marked),
-        so tests/diagnostics can see that the model attempted an unknown tool.
-        """
         allowed = set(TOOLS.keys())
         for s in plan.get("steps", []):
             tool = s.get("tool", None)
@@ -522,7 +563,7 @@ class Planner:
             if tool not in allowed:
                 s["tool"] = None
                 s["args"] = None
-                s["_coerced_unknown_tool"] = True  # <-- key
+                s["_coerced_unknown_tool"] = True
         return plan
 
     def _ensure_compose_answer(self, plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -541,12 +582,6 @@ class Planner:
         return plan
 
     def _prune_intermediate_non_tool_steps(self, plan: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Enforce contract:
-        - compose_answer is final and tool=None
-        - prune intermediate tool=None steps EXCEPT those that were coerced from unknown tools
-        (kept for visibility; Agent still won't execute them because tool=None).
-        """
         steps = plan.get("steps", [])
 
         tool_steps: List[Dict[str, Any]] = []
@@ -558,7 +593,6 @@ class Planner:
             if s.get("tool") is not None:
                 tool_steps.append(s)
             elif s.get("_coerced_unknown_tool") is True:
-                # keep it (non-executable), so the regression test can find it
                 coerced_unknown_steps.append(s)
             # else: prune plain non-tool intermediate steps
 
@@ -590,7 +624,6 @@ class Planner:
 
         compose = next((s for s in steps if s.get("id") == "compose_answer"), None)
         if compose is not None:
-            # compose depends on ALL prior tool steps (and never itself)
             compose["requires"] = [
                 s.get("id") for s in steps
                 if s.get("id") != "compose_answer" and s.get("tool") is not None
@@ -603,13 +636,10 @@ class Planner:
 
         for s in plan.get("steps", []):
             tool = s.get("tool")
-
             if tool is None:
-                # compose_answer only
                 continue
 
             if tool not in allowed:
-                # Should not happen due to coercion, but keep defensive
                 raise ValueError(f"Planner invented unknown tool '{tool}'.")
 
             args = s.get("args")
@@ -648,7 +678,11 @@ class Planner:
         )
 
     def _debug_plan_summary(self, data: Dict[str, Any]) -> None:
-        print("[PLANNER DEBUG] Parsed plan summary:")
+        if not self._trace_enabled("summary"):
+            return
+
+        tag = "[PLANNER]" if self.get_trace_level() == "summary" else "[PLANNER DEBUG]"
+        print(f"{tag} Plan summary:")
         print(f"  Goal: {data.get('goal')}")
         for s in data.get("steps", []):
             print(f"    - {s.get('id')} | tool={s.get('tool')} | requires={s.get('requires')}")
