@@ -36,12 +36,14 @@ class Planner:
     """
     Planner: ask the LLM to produce a structured Plan (JSON).
 
-    Stabilisations:
-    - Deterministic local sanitisation for common "almost JSON" model bugs (e.g. `"https"://`)
-    - Safer LLM JSON repair prompt (embeds bad output as escaped JSON string)
+    Hardening:
+    - Deterministic sanitisation for common "almost JSON" bugs
+    - JSON repair prompt (embeds bad output as escaped JSON string)
     - Normalises steps (id/description/tool/args/requires)
+    - Coerces UNKNOWN tools to tool=None (never raises for invented tool names)
     - Enforces compose_answer final step and dependencies
-    - Replanning enforces forbidden tool constraints; falls back only if needed
+    - Enforces "no intermediate tool=None steps" by pruning them
+    - Replanning can forbid tools; fallback for replan violations
     """
 
     MAX_JSON_REPAIR_ATTEMPTS = 2
@@ -76,8 +78,7 @@ class Planner:
             self._debug_plan_summary(plan_json)
             return self._to_plan(plan_json)
 
-        # Deterministic shortcut 2: likely memory RECALL (e.g., "What bike do I like?")
-        # -> let the agent answer from injected memory/context without calling tools.
+        # Deterministic shortcut 2: likely memory recall -> no tools
         if (not is_replan) and self._is_likely_memory_recall_request(user_input):
             plan_json = {
                 "goal": f"Answer the user's question using available context/memory: {user_input}",
@@ -119,7 +120,6 @@ class Planner:
         print(raw)
         print("=" * 80 + "\n")
 
-        # Parse + normalise (includes tool validation)
         plan_json = self._parse_or_repair_json(
             raw,
             original_prompt=prompt,
@@ -128,12 +128,10 @@ class Planner:
             is_replan=is_replan,
         )
 
-        # Enforce forbidden tools (especially during replans).
+        # Enforce forbidden tools (esp. during replans). If violated during replan, fallback safely.
         try:
             self._enforce_forbidden_tools(plan_json, forbidden_tools=forbidden_tools)
         except Exception as e:
-            # If the model violates forbidden tools, fall back to deterministic replan plan
-            # that uses NO external tools (compose_answer only).
             if is_replan:
                 print(f"[PLANNER DEBUG] Model replan violated forbidden tools, falling back. Reason: {e}")
                 plan_json = self._deterministic_replan_plan(
@@ -142,16 +140,15 @@ class Planner:
                     failure_text=failure_text,
                 )
             else:
-                # Non-replan: still treat this as a planning error.
                 raise
 
         self._debug_plan_summary(plan_json)
         return self._to_plan(plan_json)
 
+    # --------------------------- heuristics ---------------------------
+
     def _is_memory_only_request(self, user_input: str) -> bool:
         s = (user_input or "").lower().strip()
-
-        # Only treat as memory-write when user explicitly asks to store/remember.
         return (
             s.startswith("remember:") or
             s.startswith("remember ") or
@@ -164,14 +161,8 @@ class Planner:
         )
 
     def _is_likely_memory_recall_request(self, user_input: str) -> bool:
-        """
-        Heuristic: questions that look like "what is my X" / "what do i like" / "which X did i say"
-        should NOT cause tool calls. Let the agent answer from context/memory injection.
-        Avoid triggering for time/weather/url-style questions.
-        """
         s = (user_input or "").lower().strip()
 
-        # If the user is clearly asking for a tool-requiring thing, do not shortcut.
         tool_intent_markers = [
             "time is it",
             "what time",
@@ -277,11 +268,7 @@ class Planner:
         observations_text: str,
         failure_text: str,
     ) -> Dict[str, Any]:
-        """
-        Fallback replanning: do NOT call tools.
-        The agent can explain using failure_text/observations_text already available.
-        """
-        _ = observations_text  # kept for future extensions
+        _ = observations_text
         _ = failure_text
 
         return {
@@ -309,14 +296,12 @@ class Planner:
         is_replan: bool,
     ) -> Dict[str, Any]:
         last_err: Exception | None = None
-        text = raw or ""
-
+        text = (raw or "")
         text = self._sanitize_common_model_json_bugs(text)
 
-        # Stage 7: tool set may include MCP tools injected at runtime.
-        # Build allowed tools dynamically for repair prompts.
-        from tools import TOOLS  # local import avoids circular imports at module import time
-        allowed_tool_names = sorted(TOOLS.keys())
+        # allow MCP tools at runtime
+        from tools import TOOLS as _TOOLS
+        allowed_tool_names = sorted(_TOOLS.keys())
 
         for attempt in range(self.MAX_JSON_REPAIR_ATTEMPTS + 1):
             try:
@@ -334,7 +319,7 @@ class Planner:
                 repair_prompt = self._build_json_repair_prompt(
                     bad_output=text,
                     original_prompt=original_prompt,
-                    allowed_tools=allowed_tool_names,  # <-- NEW
+                    allowed_tools=allowed_tool_names,
                 )
 
                 print("\n" + "=" * 80)
@@ -356,32 +341,27 @@ class Planner:
         )
 
     def _contains_ref(self, obj: Any) -> bool:
-            if isinstance(obj, dict):
-                # explicit $ref key
-                if "$ref" in obj:
-                    return True
-                return any(self._contains_ref(v) for v in obj.values())
-            if isinstance(obj, list):
-                return any(self._contains_ref(v) for v in obj)
-            if isinstance(obj, str):
-                s = obj.lower()
-                # common placeholder patterns
-                if "$ref" in s:
-                    return True
-                if "steps/" in s and "result" in s:
-                    return True
-            return False
-
+        if isinstance(obj, dict):
+            if "$ref" in obj:
+                return True
+            return any(self._contains_ref(v) for v in obj.values())
+        if isinstance(obj, list):
+            return any(self._contains_ref(v) for v in obj)
+        if isinstance(obj, str):
+            s = obj.lower()
+            if "$ref" in s:
+                return True
+            if "steps/" in s and "result" in s:
+                return True
+        return False
 
     def _sanitize_common_model_json_bugs(self, s: str) -> str:
         if not s:
             return s
-
         s = s.replace('"https"://', "https://")
         s = s.replace('"http"://', "http://")
         s = s.replace('from "https"://', "from https://")
         s = s.replace('from "http"://', "from http://")
-
         s = s.replace("“", '"').replace("”", '"').replace("’", "'")
         return s
 
@@ -441,6 +421,7 @@ class Planner:
         raise ValueError(f"Planner output was not valid JSON:\n{raw}")
 
     def _build_json_repair_prompt(self, *, bad_output: str, original_prompt: str, allowed_tools: list[str]) -> str:
+        _ = original_prompt
         bad_as_json_string = json.dumps(bad_output)
         allowed_tools_str = ", ".join(allowed_tools)
 
@@ -456,12 +437,13 @@ class Planner:
             "Constraints:\n"
             "- FINAL step must be id='compose_answer' with tool=null and args=null.\n"
             "- compose_answer.requires must include every prior step id.\n"
-            f"- tool names must be one of: {allowed_tools_str}\n\n"
+            f"- tool names must be one of: {allowed_tools_str}\n"
             "- Do NOT use $ref/symbolic placeholders in tool args; args MUST be concrete JSON values.\n\n"
             "The prior model output is provided as an escaped JSON string below.\n"
             "Parse it, fix it, and output ONLY the repaired plan JSON.\n\n"
             f"BAD_OUTPUT_JSON_STRING: {bad_as_json_string}\n"
         )
+
     # --------------------------- normalisation / guardrails ---------------------------
 
     def _normalise_plan_json(
@@ -472,16 +454,21 @@ class Planner:
         failure_text: str,
         is_replan: bool,
     ) -> Dict[str, Any]:
+        _ = observations_text
+        _ = failure_text
+        _ = is_replan
+
         if not isinstance(data, dict) or "steps" not in data:
             raise ValueError(f"Unsupported planner JSON shape: {type(data)}")
 
         plan: Dict[str, Any] = data
 
         plan = self._ensure_step_fields(plan)
+        plan = self._coerce_unknown_tools_to_none(plan)   # <-- KEY FIX (no raise)
         plan = self._ensure_compose_answer(plan)
-        plan = self._prune_non_tool_steps(plan)
+        plan = self._prune_intermediate_non_tool_steps(plan)  # <-- KEY FIX (prune)
         plan = self._sanitize_requires(plan)
-        self._validate_tools(plan)
+        self._validate_tools(plan)  # validates only remaining tool steps
 
         return plan
 
@@ -492,22 +479,27 @@ class Planner:
                 continue
 
             tool = s.get("tool", None)
-            args = s.get("args", {})
+            args = s.get("args", None)
 
-            # args must be dict for tool steps
-            if tool is not None and not isinstance(args, dict):
-                args = {}
-
+            # Normalise requires
             req = s.get("requires", [])
             if not isinstance(req, list):
                 req = [req]
+
+            # If tool is None => args must be None
+            if tool is None:
+                args = None
+            else:
+                # tool step => args must be dict
+                if not isinstance(args, dict):
+                    args = {}
 
             out.append(
                 {
                     "id": s.get("id", f"step_{i+1}"),
                     "description": s.get("description", ""),
                     "tool": tool,
-                    "args": None if tool is None else args,
+                    "args": args,
                     "requires": req,
                 }
             )
@@ -515,9 +507,27 @@ class Planner:
         plan["steps"] = out
         return plan
 
+    def _coerce_unknown_tools_to_none(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        If the LLM invents a tool, do NOT raise.
+        Coerce that step to tool=None and args=None, but keep the step (marked),
+        so tests/diagnostics can see that the model attempted an unknown tool.
+        """
+        allowed = set(TOOLS.keys())
+        for s in plan.get("steps", []):
+            tool = s.get("tool", None)
+            if tool is None:
+                s["args"] = None
+                continue
+            if tool not in allowed:
+                s["tool"] = None
+                s["args"] = None
+                s["_coerced_unknown_tool"] = True  # <-- key
+        return plan
+
     def _ensure_compose_answer(self, plan: Dict[str, Any]) -> Dict[str, Any]:
         steps = plan.get("steps", [])
-        if not any(s.get("id") == "compose_answer" for s in steps):
+        if not any(isinstance(s, dict) and s.get("id") == "compose_answer" for s in steps):
             steps.append(
                 {
                     "id": "compose_answer",
@@ -530,15 +540,29 @@ class Planner:
         plan["steps"] = steps
         return plan
 
-    def _prune_non_tool_steps(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+    def _prune_intermediate_non_tool_steps(self, plan: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Enforce contract: only final compose_answer may be tool=None.
-        Drop any intermediate tool=None steps.
+        Enforce contract:
+        - compose_answer is final and tool=None
+        - prune intermediate tool=None steps EXCEPT those that were coerced from unknown tools
+        (kept for visibility; Agent still won't execute them because tool=None).
         """
         steps = plan.get("steps", [])
-        tool_steps = [s for s in steps if s.get("tool") is not None]
-        compose = next((s for s in steps if s.get("id") == "compose_answer"), None)
 
+        tool_steps: List[Dict[str, Any]] = []
+        coerced_unknown_steps: List[Dict[str, Any]] = []
+
+        for s in steps:
+            if s.get("id") == "compose_answer":
+                continue
+            if s.get("tool") is not None:
+                tool_steps.append(s)
+            elif s.get("_coerced_unknown_tool") is True:
+                # keep it (non-executable), so the regression test can find it
+                coerced_unknown_steps.append(s)
+            # else: prune plain non-tool intermediate steps
+
+        compose = next((s for s in steps if s.get("id") == "compose_answer"), None)
         if compose is None:
             compose = {
                 "id": "compose_answer",
@@ -547,34 +571,29 @@ class Planner:
                 "args": None,
                 "requires": [],
             }
+        else:
+            compose["tool"] = None
+            compose["args"] = None
 
-        plan["steps"] = tool_steps + [compose]
+        plan["steps"] = tool_steps + coerced_unknown_steps + [compose]
         return plan
 
     def _sanitize_requires(self, plan: Dict[str, Any]) -> Dict[str, Any]:
         steps = plan.get("steps", [])
-        ids = {s.get("id") for s in steps}
+        ids = {s.get("id") for s in steps if isinstance(s, dict)}
 
         for s in steps:
             req = s.get("requires", [])
             if not isinstance(req, list):
-                req = [req]
+                req = []
+            s["requires"] = [r for r in req if isinstance(r, str) and r in ids and r != s.get("id")]
 
-            s["requires"] = [
-                r
-                for r in req
-                if isinstance(r, str)
-                and r.strip()
-                and r in ids
-            ]
-
-        # Force compose_answer to depend on ALL prior tool steps
         compose = next((s for s in steps if s.get("id") == "compose_answer"), None)
         if compose is not None:
+            # compose depends on ALL prior tool steps (and never itself)
             compose["requires"] = [
-                s.get("id")
-                for s in steps
-                if s.get("id") != "compose_answer"
+                s.get("id") for s in steps
+                if s.get("id") != "compose_answer" and s.get("tool") is not None
             ]
 
         return plan
@@ -585,28 +604,21 @@ class Planner:
         for s in plan.get("steps", []):
             tool = s.get("tool")
 
-            # Unknown tool name
-            if tool is not None and tool not in allowed:
-                raise ValueError(f"Planner invented unknown tool '{tool}'.")
-
-            # Only validate args for tool steps (compose_answer has tool=None, args=None)
             if tool is None:
+                # compose_answer only
                 continue
 
-            args = s.get("args")
+            if tool not in allowed:
+                # Should not happen due to coercion, but keep defensive
+                raise ValueError(f"Planner invented unknown tool '{tool}'.")
 
-            # Tool args must be a dict (your earlier normalisation already enforces this,
-            # but we keep this defensive).
+            args = s.get("args")
             if not isinstance(args, dict):
                 raise ValueError(f"Tool args must be an object for tool '{tool}', got {type(args).__name__}.")
 
-            # Stage 7: disallow JSON references / placeholders inside tool args.
-            # We do not support cross-step variable references in args.
             if self._contains_ref(args):
-                raise ValueError(
-                    "Planner used $ref/symbolic placeholder in tool args; args must be concrete JSON values."
-                )
-    
+                raise ValueError("Planner used $ref/symbolic placeholder in tool args; args must be concrete JSON values.")
+
     def _enforce_forbidden_tools(self, plan: Dict[str, Any], *, forbidden_tools: Set[str]) -> None:
         if not forbidden_tools:
             return
